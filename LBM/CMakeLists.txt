@@ -16,11 +16,17 @@ include_directories(
 
 ## 2. 查找外部库和工具链库
 find_package(glfw3 REQUIRED)
+message(STATUS "Found GLFW: ${glfw3_DIR}")
 find_package(Vulkan REQUIRED)
+message(STATUS "Found Vulkan: ${Vulkan_DIR}")
 find_package(Ktx REQUIRED)
+message(STATUS "Found Ktx: ${Ktx_DIR}")
 find_package(glm REQUIRED)
+message(STATUS "Found glm: ${glm_DIR}")
 find_package(Imath REQUIRED)
+message(STATUS "Found Imath: ${Imath_DIR}")
 find_package(Alembic REQUIRED)
+message(STATUS "Found Alembic: ${Alembic_DIR}")
 
 ## 3. 着色器和资产文件管理
 find_program(GLSLANG_VALIDATOR_EXECUTABLE NAMES glslangValidator glslangValidator.exe)

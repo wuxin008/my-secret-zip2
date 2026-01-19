@@ -1,0 +1,22 @@
+@echo off
+glslangValidator  -g -gVS -V -o particle_vert.spv		    particle.vert
+glslangValidator  -g -gVS -V -o particle_frag.spv		    particle.frag
+glslangValidator  -g -gVS -V -o wireframe_vert.spv		    wireframe.vert
+glslangValidator  -g -gVS -V -o wireframe_frag.spv		    wireframe.frag
+glslangValidator  -g -gVS -V -o skybox_vert.spv			    skybox.vert
+glslangValidator  -g -gVS -V -o skybox_frag.spv			    skybox.frag
+glslangValidator  -g -gVS -V -o model_vert.spv		        model.vert
+glslangValidator  -g -gVS -V -o model_frag.spv		        model.frag
+glslangValidator  -g -gVS -V -o surface_vert.spv		    surface.vert
+glslangValidator  -g -gVS -V -o surface_frag.spv		    surface.frag
+glslangValidator  -g -gVS -V -o voxelize_model_comp.spv		voxelize_model.comp
+glslangValidator  -g -gVS -V -o init_comp.spv			    init.comp
+glslangValidator  -g -gVS -V -o surface0_comp.spv		    surface0.comp
+glslangValidator  -g -gVS -V -o surface1_comp.spv		    surface1.comp
+glslangValidator  -g -gVS -V -o surface2_comp.spv		    surface2.comp
+glslangValidator  -g -gVS -V -o surface3_comp.spv		    surface3.comp
+glslangValidator  -g -gVS -V -o collide_and_stream_comp.spv collide_and_stream.comp
+glslangValidator  -g -gVS -V -o calc_comp.spv			    calc.comp
+glslangValidator  -g -gVS -V -o raytrace_comp.spv			raytrace.comp
+glslangValidator  -g -gVS -V -o filtered_comp.spv           filtered.comp
+glslangValidator  -g -gVS -V -o postprocess_comp.spv		postprocess.comp
