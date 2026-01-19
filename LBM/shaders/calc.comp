@@ -1,0 +1,530 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#extension GL_KHR_shader_subgroup_ballot : enable
+#include "simulation_header.glsl"
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 get_position(uvec3 xyz) {
+    return vec3(xyz);
+}
+
+vec3 trilinear3(const vec3 p, const vec3 v[8]) { // trilinear interpolation, p: position in unit cube, v: corner vectors in unit cube
+	const float x1=p.x, y1=p.y, z1=p.z, x0=1.0f-x1, y0=1.0f-y1, z0=1.0f-z1; // calculate interpolation factors
+	return (x0*y0*z0)*v[0]+(x1*y0*z0)*v[1]+(x1*y0*z1)*v[2]+(x0*y0*z1)*v[3]+(x0*y1*z0)*v[4]+(x1*y1*z0)*v[5]+(x1*y1*z1)*v[6]+(x0*y1*z1)*v[7]; // perform trilinear interpolation
+}
+
+vec3 load3(uint n) {
+    float rhon, uxn, uyn, uzn;
+    load_macro(n, rhon, uxn, uyn, uzn);
+    //return vec3(vels[n], vels[n + ubo.Nxyz], vels[n + 2u*ubo.Nxyz]);
+    return vec3(uxn, uyn, uzn);
+}
+
+//vec3 interpolate_u(const vec3 p) { // trilinear interpolation of velocity at point p
+//	const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//	const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//	const vec3 pn = vec3(xa-float(xb), ya-float(yb), za-float(zb)); // calculate interpolation factors
+//	vec3 un[8]; // velocitiy at unit cube corner points
+//	for(uint c=0u; c<8u; c++) { // count over eight corner points
+//		const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//		const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//		const uint n = uint(x)+uint(y+z*ubo.Ny)*uint(ubo.Nx); // calculate lattice linear index
+//		un[c] = load3(n); // load velocity from lattice point
+//	}
+//	return trilinear3(pn, un); // perform trilinear interpolation
+//}
+
+vec3 interpolate_u(vec3 pos) {
+    ivec3 lattice = ivec3(pos);
+    vec3 factor = pos - lattice;
+
+    vec3 u[8];
+    for (uint a = 0; a < 8; ++a) {
+        uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
+        uint x = lattice.x + i, y = lattice.y + j, z = lattice.z + k;
+        uint n = x + (y + z * ubo.Ny) * ubo.Nx;
+        float rhon, uxn, uyn, uzn;
+        load_macro(n, rhon, uxn, uyn, uzn);
+        //u[a] = vec3(vels[n], vels[n + ubo.Nxyz], vels[n + 2u * ubo.Nxyz]);
+        u[a] = vec3(uxn, uyn, uzn);
+    }
+    return trilinear3(factor, u);
+}
+
+//vec3 particle_boundary_force(const vec3 p) { // normalized pseudo-force to prevent particles from entering solid boundaries or exiting fluid phase
+//	const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//	const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//	const float x1=xa-float(xb), y1=ya-float(yb), z1=za-float(zb); // calculate interpolation factors
+//	vec3 boundary_force = vec3(0.0f, 0.0f, 0.0f);
+//	float boundary_distance = 2.0f;
+//	for(uint c=0u; c<8u; c++) { // count over eight corner points
+//		const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//		const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//		const uint n = uint(x)+uint(y+z*ubo.Ny)+uint(ubo.Nx); // calculate lattice linear index
+//		if((flags[n]&(TYPE_S|TYPE_G)) != 0) {
+//			boundary_force += vec3(0.5f, 0.5f, 0.5f)-vec3(i, j, k);
+//			boundary_distance = min(boundary_distance, length(vec3(x1, y1, z1)-vec3(i, j, k)));
+//		}
+//	}
+//	const float particle_radius = 0.5f; // has to be between 0.0f and 0.5f, default: 0.5f (hydrodynamic radius)
+//	return length(boundary_force) > 1e-6 && boundary_distance-0.5f<particle_radius ? normalize(boundary_force) : vec3(0.0f, 0.0f, 0.0f);
+//} // particle_boundary_force()
+
+vec3 particle_boundary_force(vec3 pos) {
+    ivec3 lattice = ivec3(pos);
+    vec3 factor = pos - vec3(lattice);
+
+    vec3 force = vec3(0.0f);
+    float distance = 2.0f;
+    for (uint q = 1; q < Q; ++q){
+        ivec3 nb = e[q] + lattice;
+        if (nb.x <= 0 || nb.x >= ubo.Nx - 1) {
+            force.x = lattice.x - nb.x;
+        }
+        if (nb.y <= 0 || nb.y >= ubo.Ny - 1) {
+            force.y = lattice.y - nb.y;
+        }
+        if (nb.z <= 0 || nb.z >= ubo.Nz - 1) {
+            force.z = lattice.z - nb.z;
+        }
+        distance = min(distance, length(vec3(nb + 0.5f) - pos));
+    }
+
+    return length(force) > 1e-6 && distance < 1.0f ? normalize(force) : vec3(0.0f);
+}
+
+//void atomicAdd(const uint n, const float val) {
+//    float old = val; while((old=atomicExchange(cfs[n], atomicExchange(cfs[n], 0.0f)+old))!=0.0f);
+//}
+
+// void atomicAdd(const uint n, const float val) {
+//     atomicAdd(cfs[n], val);
+// }
+// 
+// void spread_force(vec3 p, vec3 Fn) {
+//     ivec3 lattice = ivec3(p);
+//     vec3 factor = p - lattice;
+// 
+//     for (uint a = 0; a < 8; ++a) {
+//         uint i = (a & 0x04u) >> 2, j=(a & 0x02u) >> 1, k = a & 0x01u;
+//         uint x = lattice.x + i, y = lattice.y + j, z = lattice.z + k;
+//         uint n = x + (y + z * ubo.Ny) * ubo.Nx;
+//         const float d = (1.0f-abs(factor.x-float(i)))*(1.0f-abs(factor.y-float(j)))*(1.0f-abs(factor.z-float(k)));
+//         atomicAdd(            uint(n), Fn.x*d); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
+//         atomicAdd(   ubo.Nxyz+uint(n), Fn.y*d); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
+//         atomicAdd(2u*ubo.Nxyz+uint(n), Fn.z*d); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
+//     }
+// }
+
+//void spread_force(vec3 p, vec3 Fn) {
+//    const float xa=p.x-0.5f+1.5f*float(ubo.Nx), ya=p.y-0.5f+1.5f*float(ubo.Ny), za=p.z-0.5f+1.5f*float(ubo.Nz); // subtract lattice offsets
+//    const uint xb=uint(xa), yb=uint(ya), zb=uint(za); // integer casting to find bottom left corner
+//    const float x1=xa-float(xb), y1=ya-float(yb), z1=za-float(zb); // calculate interpolation factors
+//    for(uint c=0u; c<8u; c++) { // count over eight corner points
+//        const uint i=(c&0x04u)>>2, j=(c&0x02u)>>1, k=c&0x01u; // disassemble c into corner indices ijk
+//        const uint x=(xb+i)%ubo.Nx, y=(yb+j)%ubo.Ny, z=(zb+k)%ubo.Nz; // calculate corner lattice positions
+//        const uint n = uint(x)+uint(y+z*ubo.Ny)*uint(ubo.Nx); // calculate lattice linear index
+//        const float d = (1.0f-abs(x1-float(i)))*(1.0f-abs(y1-float(j)))*(1.0f-abs(z1-float(k))); // force spreading
+//        atomicAdd(cfs[            uint(n)], 0.01f*Fn.x*d); //atomic_add_f(&F[                  n], Fn.x*d); // F[                 n] += Fn.x*d;
+//        atomicAdd(cfs[   ubo.Nxyz+uint(n)], 0.01f*Fn.y*d); //atomic_add_f(&F[   ubo.Nxyz+(uint)n], Fn.y*d); // F[    def_N+(ulong)n] += Fn.y*d;
+//        atomicAdd(cfs[2u*ubo.Nxyz+uint(n)], 0.01f*Fn.z*d); //atomic_add_f(&F[2u*ubo.Nxyz+(uint)n], Fn.z*d); // F[2ul*def_N+(ulong)n] += Fn.z*d;
+//    }
+//}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void calculate_j8(const uvec3 xyz, inout uint j[8]) {
+	const uint x0 = uint( xyz.x); // cube stencil
+	const uint xp = uint( xyz.x+1u);
+	const uint y0 = uint( xyz.y    *ubo.Nx);
+	const uint yp = uint((xyz.y+1u)*ubo.Nx);
+	const uint z0 = uint( xyz.z    *uint(ubo.Ny*ubo.Nx));
+	const uint zp = uint((xyz.z+1u)*uint(ubo.Ny*ubo.Nx));
+	j[0] = x0+y0+z0; // 000 // cube stencil
+	j[1] = xp+y0+z0; // +00
+	j[2] = xp+y0+zp; // +0+
+	j[3] = x0+y0+zp; // 00+
+	j[4] = x0+yp+z0; // 0+0
+	j[5] = xp+yp+z0; // ++0
+	j[6] = xp+yp+zp; // +++
+	j[7] = x0+yp+zp; // 0++
+} // calculate_j8()
+
+uint triangle_table_data[1920] = { // source: Paul Bourke, http://paulbourke.net/geometry/polygonise/, termination value 15, bit packed
+    255u,255u,255u,255u,255u,255u,255u, 15u, 56u,255u,255u,255u,255u,255u,255u, 16u,249u,255u,255u,255u,255u,255u, 31u, 56u,137u,241u,255u,255u,255u,255u, 33u,250u,255u,255u,255u,255u,255u, 15u, 56u, 33u,250u,255u,255u,255u,255u, 41u, 10u,146u,
+    255u,255u,255u,255u, 47u, 56u,162u,168u,137u,255u,255u,255u,179u,242u,255u,255u,255u,255u,255u, 15u, 43u,184u,240u,255u,255u,255u,255u,145u, 32u,179u,255u,255u,255u,255u, 31u, 43u,145u,155u,184u,255u,255u,255u,163u,177u, 58u,255u,255u,255u,
+    255u, 15u, 26u,128u,138u,171u,255u,255u,255u,147u, 48u,155u,171u,249u,255u,255u,159u,168u,138u,251u,255u,255u,255u,255u,116u,248u,255u,255u,255u,255u,255u, 79u,  3u, 55u,244u,255u,255u,255u,255u, 16u,137u,116u,255u,255u,255u,255u, 79u,145u,
+    116u,113u, 19u,255u,255u,255u, 33u,138u,116u,255u,255u,255u,255u, 63u,116u,  3u, 20u,162u,255u,255u,255u, 41u,154u, 32u, 72u,247u,255u,255u, 47u,154u,146u, 39u, 55u,151u,244u,255u, 72u, 55u, 43u,255u,255u,255u,255u,191u,116u, 43u, 36u, 64u,
+    255u,255u,255u,  9u,129u,116u, 50u,251u,255u,255u, 79u,183u, 73u,155u, 43u, 41u,241u,255u,163u, 49u,171u,135u,244u,255u,255u, 31u,171u, 65u, 27u, 64u,183u,244u,255u,116u,152u,176u,185u,186u, 48u,255u, 79u,183u,180u,153u,171u,255u,255u,255u,
+     89u,244u,255u,255u,255u,255u,255u,159u, 69u,128u,243u,255u,255u,255u,255u, 80u, 20u,  5u,255u,255u,255u,255u,143u, 69u, 56u, 53u, 81u,255u,255u,255u, 33u,154u, 69u,255u,255u,255u,255u, 63u,128u, 33u, 74u, 89u,255u,255u,255u, 37u, 90u, 36u,
+      4u,242u,255u,255u, 47u, 90u, 35u, 53u, 69u, 67u,248u,255u, 89u, 36u,179u,255u,255u,255u,255u, 15u, 43u,128u, 75u, 89u,255u,255u,255u, 80u,  4u, 81u, 50u,251u,255u,255u, 47u, 81u, 82u, 40u,184u,132u,245u,255u, 58u,171u, 49u, 89u,244u,255u,
+    255u, 79u, 89u,128u,129u, 26u,184u,250u,255u, 69u, 80u,176u,181u,186u, 48u,255u, 95u,132u,133u,170u,184u,255u,255u,255u,121u, 88u,151u,255u,255u,255u,255u,159u,  3u, 89u, 83u, 55u,255u,255u,255u,112u,  8u,113u, 81u,247u,255u,255u, 31u, 53u,
+     83u,247u,255u,255u,255u,255u,121u,152u,117u, 26u,242u,255u,255u,175u, 33u, 89u, 80u,  3u,117u,243u,255u,  8u,130u, 82u, 88u,167u, 37u,255u, 47u, 90u, 82u, 51u,117u,255u,255u,255u,151u,117u,152u,179u,242u,255u,255u,159u,117u,121u,146u,  2u,
+    114u,251u,255u, 50u, 11u,129u,113u, 24u,117u,255u,191u, 18u, 27u,119u, 81u,255u,255u,255u, 89u,136u,117u, 26u,163u,179u,255u, 95u,  7u,  5u,121u, 11u,  1u,186u, 10u,171u,176u, 48u, 90u,128u,112u,117u,176u, 90u,183u,245u,255u,255u,255u,255u,
+    106u,245u,255u,255u,255u,255u,255u, 15u, 56u,165u,246u,255u,255u,255u,255u,  9u, 81u,106u,255u,255u,255u,255u, 31u, 56u,145u, 88u,106u,255u,255u,255u, 97u, 37u, 22u,255u,255u,255u,255u, 31u, 86u, 33u, 54u,128u,255u,255u,255u,105u,149u, 96u,
+     32u,246u,255u,255u, 95u,137u,133u, 82u, 98u, 35u,248u,255u, 50u,171u, 86u,255u,255u,255u,255u,191u,128u, 43u,160u, 86u,255u,255u,255u, 16u, 41u,179u,165u,246u,255u,255u, 95u,106u,145u,146u, 43u,137u,251u,255u, 54u,107u, 53u, 21u,243u,255u,
+    255u, 15u,184u,176u,  5u, 21u,181u,246u,255u,179u,  6u, 99u, 96u,  5u,149u,255u,111u,149u,150u,187u,137u,255u,255u,255u,165u, 70u,135u,255u,255u,255u,255u, 79u,  3u,116u, 99u,165u,255u,255u,255u,145u, 80u,106u, 72u,247u,255u,255u,175u, 86u,
+    145u, 23u, 55u,151u,244u,255u, 22u, 98u, 21u,116u,248u,255u,255u, 31u, 82u, 37u, 54u, 64u, 67u,247u,255u, 72u,151u, 80u, 96u,  5u, 98u,255u,127u,147u,151u, 52u,146u,149u, 38u,150u,179u,114u, 72u,106u,245u,255u,255u, 95u,106u,116u, 66u,  2u,
+    114u,251u,255u, 16u, 73u,135u, 50u, 91u,106u,255u,159u, 18u,185u,146u,180u,183u, 84u,106u, 72u, 55u, 91u, 83u, 81u,107u,255u, 95u,177u,181u, 22u,176u,183u,  4u,180u, 80u,  9u, 86u, 48u,182u, 54u, 72u,103u,149u,150u, 75u,151u,183u,249u,255u,
+     74u,105u,164u,255u,255u,255u,255u, 79u,106u,148u, 10u, 56u,255u,255u,255u, 10u,161u,  6u, 70u,240u,255u,255u,143u, 19u, 24u,134u, 70u, 22u,250u,255u, 65u, 25u, 66u, 98u,244u,255u,255u, 63u,128u, 33u, 41u,148u, 98u,244u,255u, 32u, 68u, 98u,
+    255u,255u,255u,255u,143u, 35u, 40u, 68u, 98u,255u,255u,255u, 74u,169u, 70u, 43u,243u,255u,255u, 15u, 40u,130u, 75u,169u,164u,246u,255u,179u,  2u, 97u, 96u,100u,161u,255u,111u, 20u, 22u, 74u, 24u, 18u,139u, 27u,105u,148u, 99u, 25u,179u, 54u,
+    255u,143u, 27u, 24u,176u, 22u, 25u,100u, 20u,179u, 54u,  6u, 96u,244u,255u,255u,111u,132u,107u,248u,255u,255u,255u,255u,167u,118u,168u,152u,250u,255u,255u, 15u, 55u,160u,  7u,169u,118u,250u,255u,106u, 23u,122u,113u, 24u,  8u,255u,175u,118u,
+    122u, 17u, 55u,255u,255u,255u, 33u, 22u,134u,129u,137u,118u,255u, 47u,150u,146u, 97u,151u,144u,115u,147u,135u,112u, 96u,  6u,242u,255u,255u,127u, 35u,118u,242u,255u,255u,255u,255u, 50u,171u,134u,138u,137u,118u,255u, 47u,112u,114u, 11u,121u,
+    118u,154u,122u,129u, 16u,135u,161u,103u,167u, 50u,187u, 18u, 27u,167u, 22u,118u,241u,255u,152u,134u,118u, 25u,182u, 54u, 49u,  6u, 25u,107u,247u,255u,255u,255u,255u,135u,112u, 96u,179u,176u,  6u,255u,127u,107u,255u,255u,255u,255u,255u,255u,
+    103u,251u,255u,255u,255u,255u,255u, 63u,128u,123u,246u,255u,255u,255u,255u, 16u,185u,103u,255u,255u,255u,255u,143u,145u, 56u,177u,103u,255u,255u,255u, 26u, 98u,123u,255u,255u,255u,255u, 31u,162u,  3u,104u,123u,255u,255u,255u,146u, 32u,154u,
+    182u,247u,255u,255u,111u,123u,162u,163u, 56u,154u,248u,255u, 39u, 99u,114u,255u,255u,255u,255u,127u,128u,103u, 96u,  2u,255u,255u,255u,114u, 38u,115u, 16u,249u,255u,255u, 31u, 38u,129u, 22u,137u,120u,246u,255u,122u,166u,113u, 49u,247u,255u,
+    255u,175u,103u,113u, 26u,120u,  1u,248u,255u, 48u,  7u,167u,160u,105u,122u,255u,127u,166u,167u,136u,154u,255u,255u,255u,134u,180u,104u,255u,255u,255u,255u, 63u,182u,  3u,  6u,100u,255u,255u,255u,104u,139u,100u,  9u,241u,255u,255u,159u,100u,
+    105u,147u, 19u, 59u,246u,255u,134u,100u,139u,162u,241u,255u,255u, 31u,162u,  3u, 11u,182u, 64u,246u,255u,180u, 72u,182u, 32u, 41u,154u,255u,175u, 57u, 58u,146u, 52u, 59u, 70u, 54u, 40u,131u, 36u,100u,242u,255u,255u, 15u, 36u,100u,242u,255u,
+    255u,255u,255u,145u, 32u, 67u, 66u, 70u,131u,255u, 31u, 73u, 65u, 34u,100u,255u,255u,255u, 24u,131u, 22u, 72u,102u, 26u,255u,175u,  1u, 10u,102u, 64u,255u,255u,255u,100u, 67u,131u,166u,  3u,147u,154u,163u, 73u,166u,244u,255u,255u,255u,255u,
+    148u,117u,182u,255u,255u,255u,255u, 15u, 56u,148u,181u,103u,255u,255u,255u,  5u, 81u,  4u,103u,251u,255u,255u,191u,103u, 56u, 52u, 69u, 19u,245u,255u, 89u,164u, 33u,103u,251u,255u,255u,111u,123u, 33u, 10u, 56u,148u,245u,255u,103u, 91u,164u,
+     36u, 74u, 32u,255u, 63u,132u, 83u, 52u, 82u, 90u,178u,103u, 39u,115u, 38u, 69u,249u,255u,255u,159u, 69u,128u,  6u, 38u,134u,247u,255u, 99u, 50u,103u, 81u, 80u,  4u,255u,111u,130u,134u, 39u,129u,132u, 21u,133u, 89u,164u, 97u,113u, 22u,115u,
+    255u, 31u,166u,113u, 22u,112u,120u,144u, 69u,  4u, 74u, 90u, 48u,106u,122u,115u,122u,166u,167u, 88u,164u,132u,250u,255u,150u,101u,155u,139u,249u,255u,255u, 63u,182u, 96u,  3u,101u,144u,245u,255u,176u,  8u,181u, 16u, 85u,182u,255u,111u, 59u,
+     54u, 85u, 19u,255u,255u,255u, 33u,154u,181u,185u,184u,101u,255u, 15u, 59u, 96u, 11u,105u,101u, 25u,162u,139u,181u,101u,  8u,165u, 37u, 32u,101u, 59u, 54u, 37u, 58u, 90u,243u,255u,133u, 89u,130u,101u, 50u, 40u,255u,159u,101u,105u,  0u, 38u,
+    255u,255u,255u, 81u, 24u,  8u,101u, 56u, 40u, 38u, 24u,101u, 18u,246u,255u,255u,255u,255u, 49u, 22u,166u,131u, 86u,150u,152u,166u,  1u, 10u,150u,  5u,101u,240u,255u, 48u, 88u,166u,255u,255u,255u,255u,175u,101u,255u,255u,255u,255u,255u,255u,
+     91u,122u,181u,255u,255u,255u,255u,191u,165u,123u,133u,  3u,255u,255u,255u,181u, 87u,186u,145u,240u,255u,255u,175u, 87u,186u,151u, 24u, 56u,241u,255u, 27u,178u, 23u, 87u,241u,255u,255u, 15u, 56u, 33u, 23u, 87u, 39u,251u,255u,121u,149u,114u,
+      9u, 34u,123u,255u,127u, 37u, 39u, 91u, 41u, 35u,152u, 40u, 82u, 42u, 83u,115u,245u,255u,255u,143u,  2u, 88u,130u, 87u, 42u,245u,255u,  9u, 81u, 58u, 53u, 55u, 42u,255u,159u, 40u, 41u,129u, 39u, 42u,117u, 37u, 49u, 53u, 87u,255u,255u,255u,
+    255u, 15u,120u,112u, 17u, 87u,255u,255u,255u,  9u,147u, 83u, 53u,247u,255u,255u,159u,120u,149u,247u,255u,255u,255u,255u,133u, 84u,138u,186u,248u,255u,255u, 95u, 64u,181u, 80u,186u, 59u,240u,255u, 16u,137u,164u,168u,171u, 84u,255u,175u, 75u,
+     74u,181u, 67u, 73u, 49u, 65u, 82u, 33u, 88u,178u, 72u,133u,255u, 15u,180u,176u, 67u,181u,178u, 81u,177u, 32u,  5u,149u,178u, 69u,133u,139u,149u, 84u,178u,243u,255u,255u,255u,255u, 82u, 58u, 37u, 67u, 53u, 72u,255u, 95u, 42u, 37u, 68u,  2u,
+    255u,255u,255u,163u, 50u,165u,131u, 69u,133u, 16u, 89u, 42u, 37u, 20u, 41u, 73u,242u,255u, 72u,133u, 53u, 83u,241u,255u,255u, 15u, 84u,  1u,245u,255u,255u,255u,255u, 72u,133u, 53u,  9u,  5u, 83u,255u,159u, 84u,255u,255u,255u,255u,255u,255u,
+    180u, 71u,185u,169u,251u,255u,255u, 15u, 56u,148u,151u,123u,169u,251u,255u,161u, 27u, 75u, 65u,112u,180u,255u, 63u, 65u, 67u, 24u, 74u, 71u,171u, 75u,180u,151u, 75u, 41u,155u, 33u,255u,159u, 71u,185u,151u,177u,178u,  1u, 56u,123u,180u, 36u,
+     66u,240u,255u,255u,191u, 71u, 75u,130u, 67u, 35u,244u,255u,146u, 42u,151u, 50u,119u,148u,255u,159u,122u,121u,164u,114u,120u, 32u,112u,115u, 58u, 42u, 71u, 26u, 10u,  4u, 26u, 42u,120u,244u,255u,255u,255u,255u,148u, 65u,113u, 23u,243u,255u,
+    255u, 79u, 25u, 20u,  7u, 24u,120u,241u,255u,  4u,115u, 52u,255u,255u,255u,255u, 79u,120u,255u,255u,255u,255u,255u,255u,169u,168u,139u,255u,255u,255u,255u, 63u,144u,147u,187u,169u,255u,255u,255u, 16u, 10u,138u,168u,251u,255u,255u, 63u,161u,
+     59u,250u,255u,255u,255u,255u, 33u, 27u,155u,185u,248u,255u,255u, 63u,144u,147u, 27u,146u,178u,249u,255u, 32u,139u,176u,255u,255u,255u,255u, 63u,178u,255u,255u,255u,255u,255u,255u, 50u, 40u,168u,138u,249u,255u,255u,159u, 42u,144u,242u,255u,
+    255u,255u,255u, 50u, 40u,168u, 16u, 24u,138u,255u, 31u, 42u,255u,255u,255u,255u,255u,255u, 49u,152u,129u,255u,255u,255u,255u, 15u, 25u,255u,255u,255u,255u,255u,255u, 48u,248u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u
+};
+
+uint triangle_table(const uint i) {
+	return (triangle_table_data[i/2u]>>(4u*(i%2u)))&0xF;
+}
+
+float interpolate(const float v1, const float v2, const float iso) { // linearly interpolate position where isosurface cuts an edge between 2 vertices at 0 and 1
+	return (iso-v1)/(v2-v1);
+}
+
+uint marching_cubes(const float vals[8], const float iso, inout vec3 triangles[15]) { // input: 8 values vals, isovalue; output: returns number of triangles, 15 triangle vertices t
+	uint cube = 0u; // determine index of which vertices are inside of the isosurface
+	for(uint i=0u; i<8u; i++) cube |= (vals[i]<iso?1:0)<<i;
+	if(cube==0u||cube==255u) return 0u; // cube is entirely inside/outside of the isosurface
+	vec3 vertex[12]; // find the vertices where the surface intersects the cube
+	vertex[ 0] = vec3(interpolate(vals[0], vals[1], iso), 0.0f, 0.0f); // interpolate vertices on all 12 edges
+	vertex[ 1] = vec3(1.0f, 0.0f, interpolate(vals[1], vals[2], iso)); // do interpolation only in 1D to reduce operations
+	vertex[ 2] = vec3(interpolate(vals[3], vals[2], iso), 0.0f, 1.0f);
+	vertex[ 3] = vec3(0.0f, 0.0f, interpolate(vals[0], vals[3], iso));
+	vertex[ 4] = vec3(interpolate(vals[4], vals[5], iso), 1.0f, 0.0f);
+	vertex[ 5] = vec3(1.0f, 1.0f, interpolate(vals[5], vals[6], iso));
+	vertex[ 6] = vec3(interpolate(vals[7], vals[6], iso), 1.0f, 1.0f);
+	vertex[ 7] = vec3(0.0f, 1.0f, interpolate(vals[4], vals[7], iso));
+	vertex[ 8] = vec3(0.0f, interpolate(vals[0], vals[4], iso), 0.0f);
+	vertex[ 9] = vec3(1.0f, interpolate(vals[1], vals[5], iso), 0.0f);
+	vertex[10] = vec3(1.0f, interpolate(vals[2], vals[6], iso), 1.0f);
+	vertex[11] = vec3(0.0f, interpolate(vals[3], vals[7], iso), 1.0f);
+	cube *= 15u;
+	uint i; // number of triangle vertices
+	for(i=0u; i<15u&&triangle_table(cube+i)!=15u; i+=3u) { // create the triangles
+		triangles[i   ] = vertex[triangle_table(cube+i   )];
+		triangles[i+1u] = vertex[triangle_table(cube+i+1u)];
+		triangles[i+2u] = vertex[triangle_table(cube+i+2u)];
+	}
+	return i/3u; // return number of triangles
+}
+
+int color_mul(const int c, const float x) { // c*x
+	const int r = min(int(fma(float((c>>16)&255), x, 0.5f)), 255);
+	const int g = min(int(fma(float((c>> 8)&255), x, 0.5f)), 255);
+	const int b = min(int(fma(float( c     &255), x, 0.5f)), 255);
+	return r<<16|g<<8|b; // values are already clamped
+}
+
+int shading(const int c, const vec3 p, const vec3 normal, const vec3 camera) { // calculate flat shading color of triangle
+    vec3 d = normalize(p - camera); // distance vector between p and camera position
+	float nl2 = sq(normal.x)+sq(normal.y)+sq(normal.z); // only one rsqrt instead of two
+	float dl2 = sq(d.x)+sq(d.y)+sq(d.z);
+	return color_mul(c, 1.5f*max(abs(dot(normal, d)*rsqrt(nl2*dl2)), 0.45f));
+    //return color_mul(c, 1.5f*max(dot(normal, d), 0.05f));
+}
+
+vec4 transitionColor(uint c) {
+    return vec4((c>>16)&0xff, (c>>8)&0xff, c&0xff, 1.0f);
+}
+
+int color_average(const int c1, const int c2) { // (c1+c2)/s
+	const vec4 cc1=transitionColor(uint(c1)), cc2=transitionColor(uint(c2));
+	return int((uint((cc1.x+cc2.x)/2)<<16) | (uint((cc1.y+cc2.y)/2)<<8) | uint((cc1.z+cc2.z)/2));
+}
+
+void addSurface(vec3 p, vec3 p0, vec3 p1, vec3 p2, uint tn, int c0, int c1, int c2) {
+    uint index = atomicAdd(surfaceCount.vertexCount, 3);
+    if (index < surfaceCount.vertexCount) {
+        surfaces[index   ] = Vertex(p+p0, transitionColor(c0) / 255.0f);
+        surfaces[index+1u] = Vertex(p+p1, transitionColor(c1) / 255.0f);
+        surfaces[index+2u] = Vertex(p+p2, transitionColor(c2) / 255.0f);
+    }
+}
+
+void calc_surface(uint index) {
+    uint x = index % ubo.Nx, y = (index - x) / ubo.Nx % ubo.Ny, z = index / ubo.Nx / ubo.Ny;
+    if (x >= ubo.Nx - 1 || y >= ubo.Ny - 1 || z >= ubo.Nz - 1) return;
+
+    vec3 p = vec3(x, y, z);
+
+    uint nbs[8];
+    calculate_j8(uvec3(x, y, z), nbs);
+
+    float vals[8];
+	for(uint q=0u; q<8u; q++) vals[q] = phis[nbs[q]];
+
+    vec3 triangles[15]; // maximum of 5 triangles with 3 vertices each
+	const uint tn = marching_cubes(vals, ubo.isoVal, triangles); // run marching cubes algorithm, isovalue slightly larger than 0.5f to fix z-fighting with graphics_flags_mc()
+    
+    vec3 tmp = vec3(ubo.Nx / 2.0f, ubo.Ny / 2.0f, ubo.Nz / 2.0f);
+    vec3 camera = tmp + 1.1f * tmp * ubo.distance * vec3(sin(radians(ubo.ry)) * cos(radians(ubo.rx)), sin(radians(ubo.ry)) * sin(radians(ubo.rx)), cos(radians(ubo.ry)));
+    //Vertex verZero = Vertex(vec3(0.0f), vec4(0.0f));
+    //for(uint q=0u; q<5; q++) {
+    //    surfaces[index*15+3u*q   ] = verZero;
+    //    surfaces[index*15+3u*q+1u] = verZero;
+    //    surfaces[index*15+3u*q+2u] = verZero;
+    //}
+
+    //if (camera.x < 0) return;
+
+    for(uint q=0u; q<tn; q++) {
+		const vec3 p0 = triangles[3u*q   ];
+		const vec3 p1 = triangles[3u*q+1u];
+		const vec3 p2 = triangles[3u*q+2u];
+		const vec3 normal = normalize(cross(p1-p0, p2-p0)); // no normalize needed for shading()
+		const int c0 = shading(0x379BFF, p+p0, normal, camera);
+		const int c1 = shading(0x379BFF, p+p1, normal, camera);
+		const int c2 = shading(0x379BFF, p+p2, normal, camera);
+        //const int c0 = 0x379BFF;
+        //const int c1 = 0x379BFF;
+        //const int c2 = 0x379BFF;
+
+        //surfaces[index*15+3u*q   ] = Vertex(p+p0, transitionColor(c0) / 255.0f);
+        //surfaces[index*15+3u*q+1u] = Vertex(p+p1, transitionColor(c1) / 255.0f);
+        //surfaces[index*15+3u*q+2u] = Vertex(p+p2, transitionColor(c2) / 255.0f);
+        addSurface(p, p0, p1, p2, tn, c0, c1, c2);
+
+		//draw_triangle_interpolated(p+p0, p+p1, p+p2, c0, c1, c2, camera_cache, bitmap, zbuffer);
+
+		//const int c = shading(0x379BFF, p+(p0+p1+p2)/3.0f, normal, camera_cache);
+		//draw_line(p+p0, p+p1, c, camera_cache, bitmap, zbuffer); // wireframe rendering
+		//draw_line(p+p0, p+p2, c, camera_cache, bitmap, zbuffer);
+		//draw_line(p+p1, p+p2, c, camera_cache, bitmap, zbuffer);
+	}
+}
+
+void addWireframe(vec3 p1, vec3 p2, vec4 c) {
+    uint index = atomicAdd(wireframeCount.vertexCount, 2);
+    if (index < wireframeCount.vertexCount) {
+        wireframes[index] = Vertex(p1, c);
+        wireframes[index+1] = Vertex(p2, c);
+        wireframeIndices[index] = index;
+        wireframeIndices[index+1] = index+1;
+    }
+}
+
+void calc_wireframe(uint n) {
+    const uint flagsn = flags[n]; // cache flags
+	const uint flagsn_bo = flagsn&TYPE_BO; // extract boundary flags
+	if(flagsn==0u||flagsn==TYPE_G) return; // don't draw regular fluid cells
+    if(flagsn==TYPE_I || flagsn==TYPE_F) return; // don't draw fluid and gas cells;
+	const uvec3 xyz = coordinates(n);
+	const vec3 p = get_position(xyz);
+	uint x0, xp, xm, y0, yp, ym, z0, zp, zm;
+	calculate_indices(n, x0, xp, xm, y0, yp, ym, z0, zp, zm);
+	const int c =  // coloring scheme
+		flagsn_bo==TYPE_S ? COLOR_S : // solid boundary
+		(((flagsn&TYPE_T)!=0)&&flagsn_bo==TYPE_E) ? color_average(COLOR_T, COLOR_E) : // both temperature boundary and equilibrium boundary
+		(((flagsn&TYPE_T)!=0)&&flagsn_bo==TYPE_MS) ? color_average(COLOR_T, COLOR_M) : // both temperature boundary and moving boundary
+		(flagsn&TYPE_T)!=0 ? COLOR_T : // temperature boundary
+		flagsn_bo==TYPE_E ? COLOR_E : // equilibrium boundary
+		flagsn_bo==TYPE_MS ? COLOR_M : // moving boundary
+		(flagsn&TYPE_F)!=0 ? COLOR_F : // fluid
+		(flagsn&TYPE_I)!=0 ? COLOR_I : // interface
+		(flagsn&TYPE_X)!=0 ? COLOR_X : // reserved type X
+		(flagsn&TYPE_Y)!=0 ? COLOR_Y : // reserved type Y
+		COLOR_0; // regular or gas cell
+	//draw_point(p, c, camera_cache, bitmap, zbuffer); // draw one pixel for every boundary cell
+	uint t;
+	t = xp+y0+z0; const bool not_xp = xyz.x<ubo.Nx-1u && flagsn==flags[t]; // +00
+	t = xm+y0+z0; const bool not_xm = xyz.x>       0u && flagsn==flags[t]; // -00
+	t = x0+yp+z0; const bool not_yp = xyz.y<ubo.Ny-1u && flagsn==flags[t]; // 0+0
+	t = x0+ym+z0; const bool not_ym = xyz.y>       0u && flagsn==flags[t]; // 0-0
+	t = x0+y0+zp; const bool not_zp = xyz.z<ubo.Nz-1u && flagsn==flags[t]; // 00+
+	t = x0+y0+zm; const bool not_zm = xyz.z>       0u && flagsn==flags[t]; // 00-
+	const vec3 p0 = vec3(p.x-0.5f, p.y-0.5f, p.z-0.5f); // ---
+	const vec3 p1 = vec3(p.x+0.5f, p.y+0.5f, p.z+0.5f); // +++
+	const vec3 p2 = vec3(p.x-0.5f, p.y-0.5f, p.z+0.5f); // --+
+	const vec3 p3 = vec3(p.x+0.5f, p.y+0.5f, p.z-0.5f); // ++-
+	const vec3 p4 = vec3(p.x-0.5f, p.y+0.5f, p.z-0.5f); // -+-
+	const vec3 p5 = vec3(p.x+0.5f, p.y-0.5f, p.z+0.5f); // +-+
+	const vec3 p6 = vec3(p.x+0.5f, p.y-0.5f, p.z-0.5f); // +--
+	const vec3 p7 = vec3(p.x-0.5f, p.y+0.5f, p.z+0.5f); // -++
+	//if(!(not_xm||not_ym)) draw_line(p0, p2, c, camera_cache, bitmap, zbuffer); // to draw the entire surface, replace || by &&
+	//if(!(not_xm||not_zm)) draw_line(p0, p4, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_ym||not_zm)) draw_line(p0, p6, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xp||not_yp)) draw_line(p1, p3, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xp||not_zp)) draw_line(p1, p5, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_yp||not_zp)) draw_line(p1, p7, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_ym||not_zp)) draw_line(p2, p5, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xm||not_zp)) draw_line(p2, p7, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_yp||not_zm)) draw_line(p3, p4, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xp||not_zm)) draw_line(p3, p6, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xm||not_yp)) draw_line(p4, p7, c, camera_cache, bitmap, zbuffer);
+	//if(!(not_xp||not_ym)) draw_line(p5, p6, c, camera_cache, bitmap, zbuffer);
+    if(!(not_xm||not_ym)) addWireframe(p0, p2, transitionColor(uint(c)));
+    if(!(not_xm||not_zm)) addWireframe(p0, p4, transitionColor(uint(c)));
+    if(!(not_ym||not_zm)) addWireframe(p0, p6, transitionColor(uint(c)));
+    if(!(not_xp||not_yp)) addWireframe(p1, p3, transitionColor(uint(c)));
+    if(!(not_xp||not_zp)) addWireframe(p1, p5, transitionColor(uint(c)));
+    if(!(not_yp||not_zp)) addWireframe(p1, p7, transitionColor(uint(c)));
+    if(!(not_ym||not_zp)) addWireframe(p2, p5, transitionColor(uint(c)));
+    if(!(not_xm||not_zp)) addWireframe(p2, p7, transitionColor(uint(c)));
+    if(!(not_yp||not_zm)) addWireframe(p3, p4, transitionColor(uint(c)));
+    if(!(not_xp||not_zm)) addWireframe(p3, p6, transitionColor(uint(c)));
+    if(!(not_xm||not_yp)) addWireframe(p4, p7, transitionColor(uint(c)));
+    if(!(not_xp||not_ym)) addWireframe(p5, p6, transitionColor(uint(c)));
+#ifdef FORCE_FIELD
+	//if(flagsn_bo==TYPE_S) {
+	//	const vec3 Fn = def_scale_F*vec3(cfs[n], cfs[ubo.Nxyz+uint(n)], cfs[2u*ubo.Nxyz+uint(n)]);
+	//	const float Fnl = length(Fn);
+	//	if(Fnl>0.0f) {
+	//		const int c = colorscale_iron(Fnl); // color boundaries depending on the force on them
+	//		draw_line(p, p+Fn, c, camera_cache, bitmap, zbuffer); // draw colored force vectors
+	//	}
+	//}
+#endif // FORCE_FIELD
+}
+
+void addParticle(vec3 pos, vec4 color) {
+    uint index = atomicAdd(particleCount.vertexCount, 1);
+    if (index < particleCount.vertexCount) {
+    //debugPrintfEXT("%d, %2d, %2d, %2d", index, pos.x, pos.y, pos.z); // print info of particles
+        particles[index] = Particle(pos, color);
+    }
+}
+
+void calc_particle(uint index, uint stride) {
+    //uint x = index % ubo.Nx, y = (index - x) / ubo.Nx % ubo.Ny, z = index / ubo.Nx / ubo.Ny;
+    uint a = ubo.Nx * ubo.Ny, z = index / a, b = index - z * a, y = b / ubo.Nx, x = b - y * ubo.Nx;
+    if (x >= ubo.Nx - 1 || y >= ubo.Ny - 1 || z >= ubo.Nz - 1) return;
+
+    bool isTargetGrid = ((x % stride) == 0) && 
+                        ((y % stride) == 0) && 
+                        ((z % stride) == 0);
+
+    bool isShow = false;
+    vec3 pos = vec3(0.0);
+    if (isTargetGrid) {
+        uint nbs[8];
+        calculate_j8(uvec3(x, y, z), nbs);
+
+        float vals[8];
+        for(uint q=0u; q<8u; q++) vals[q] = phis[nbs[q]];
+
+        for(uint q=0u; q<8u; q++) {
+            if (vals[q] >= ubo.isoVal) isShow = true;
+        }
+
+        if (isShow) {
+            float offset = float(stride) * 0.5; 
+            pos = vec3(x, y, z) + vec3(offset);
+        }
+    }
+
+    uvec4 activeThreads = subgroupBallot(isShow);
+    uint subgroupTotalCount = subgroupBallotBitCount(activeThreads);
+    uint subgroupOffset = subgroupBallotExclusiveBitCount(activeThreads);
+
+    uint globalBaseIndex = 0;
+    if (subgroupTotalCount > 0) {
+        if (subgroupElect()) {
+            globalBaseIndex = atomicAdd(particleCount.vertexCount, subgroupTotalCount);
+        }
+    }
+    globalBaseIndex = subgroupBroadcastFirst(globalBaseIndex);
+    if (isShow) {
+        uint finalIndex = globalBaseIndex + subgroupOffset;
+        particles[finalIndex] = Particle(pos, vec4(1.0f, 0.0f, 0.0f, 0.0f));
+    }
+}
+
+void main() 
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+
+    //calc_surface(index);
+
+    //calc_wireframe(index);
+
+    calc_particle(index, 1u);
+
+    totalMass[0] = 0.0f;
+
+    //uint x = index % ubo.Nx, y = (index - x) / ubo.Nx % ubo.Ny, z = index / ubo.Nx / ubo.Ny;
+    //if (x >= ubo.Nx - 1 || y >= ubo.Ny - 1 || z >= ubo.Nz - 1) return;
+    //
+    //vec3 p = vec3(x, y, z);
+    //
+    //uint nbs[8];
+    //calculate_j8(uvec3(x, y, z), nbs);
+    //
+    //float vals[8];
+	//for(uint q=0u; q<8u; q++) vals[q] = phis[nbs[q]];
+    //
+    //vec3 triangles[15]; // maximum of 5 triangles with 3 vertices each
+	//const uint tn = marching_cubes(vals, ubo.isoVal, triangles); // run marching cubes algorithm, isovalue slightly larger than 0.5f to fix z-fighting with graphics_flags_mc()
+    //
+    //vec3 tmp = vec3(ubo.Nx / 2.0f, ubo.Ny / 2.0f, ubo.Nz / 2.0f);
+    //vec3 camera = tmp + 1.1f * tmp * ubo.distance * vec3(sin(radians(ubo.ry)) * cos(radians(ubo.rx)), sin(radians(ubo.ry)) * sin(radians(ubo.rx)), cos(radians(ubo.ry)));
+    //Vertex verZero = Vertex(vec4(0.0f), vec4(0.0f));
+    //for(uint q=0u; q<5; q++) {
+    //    surfaces[index*15+3u*q   ] = verZero;
+    //    surfaces[index*15+3u*q+1u] = verZero;
+    //    surfaces[index*15+3u*q+2u] = verZero;
+    //}
+    //
+    ////if (camera.x < 0) return;
+    //
+    //for(uint q=0u; q<tn; q++) {
+	//	const vec3 p0 = triangles[3u*q   ];
+	//	const vec3 p1 = triangles[3u*q+1u];
+	//	const vec3 p2 = triangles[3u*q+2u];
+	//	const vec3 normal = normalize(cross(p1-p0, p2-p0)); // no normalize needed for shading()
+	//	const int c0 = shading(0x379BFF, p+p0, normal, camera);
+	//	const int c1 = shading(0x379BFF, p+p1, normal, camera);
+	//	const int c2 = shading(0x379BFF, p+p2, normal, camera);
+    //    //const int c0 = 0x379BFF;
+    //    //const int c1 = 0x379BFF;
+    //    //const int c2 = 0x379BFF;
+    //
+    //    surfaces[index*15+3u*q   ] = Vertex(vec4(p+p0, tn), transitionColor(c0) / 255.0f);
+    //    surfaces[index*15+3u*q+1u] = Vertex(vec4(p+p1, tn), transitionColor(c1) / 255.0f);
+    //    surfaces[index*15+3u*q+2u] = Vertex(vec4(p+p2, tn), transitionColor(c2) / 255.0f);
+    //
+	//	//draw_triangle_interpolated(p+p0, p+p1, p+p2, c0, c1, c2, camera_cache, bitmap, zbuffer);
+    //
+	//	//const int c = shading(0x379BFF, p+(p0+p1+p2)/3.0f, normal, camera_cache);
+	//	//draw_line(p+p0, p+p1, c, camera_cache, bitmap, zbuffer); // wireframe rendering
+	//	//draw_line(p+p0, p+p2, c, camera_cache, bitmap, zbuffer);
+	//	//draw_line(p+p1, p+p2, c, camera_cache, bitmap, zbuffer);
+	//}
+
+    //Particle particle = particles[index];
+    //
+    //vec3 p0 = particle.position.xyz;// cache particle position
+    //
+    //if(ubo.particleRho != 1.0f) { // FORCE_FILED
+	//    const float drho = ubo.particleRho-1.0f; // density difference leads to particle buoyancy
+	//    vec3 Fn = vec3(ubo.fx*drho, ubo.fy*drho, ubo.fz*drho); // F = F_p+F_f = (m_p-m_f)*g = (rho_p-rho_f)*g*V
+	//    spread_force(p0, Fn); // do force spreading
+	//}
+    //
+    //const vec3 p1 = p0;
+    //vec3 un = interpolate_u(p1); // trilinear interpolation of velocity at point p
+    //un = (un + length(un) * particle_boundary_force(p1));
+    //const vec3 p = p0 + un; // advect particles
+    //particles[index].position = vec4(p, 0.0f);
+}

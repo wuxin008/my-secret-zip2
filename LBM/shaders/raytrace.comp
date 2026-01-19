@@ -1,0 +1,475 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "render_header.glsl"
+
+#define TYPE_S  0x01 // 0b00000001 // (stationary or moving) solid boundary
+#define TYPE_E  0x02 // 0b00000010 // equilibrium boundary (inflow/outflow)
+#define TYPE_T  0x04 // 0b00000100 // temperature boundary
+#define TYPE_F  0x08 // 0b00001000 // fluid
+#define TYPE_I  0x10 // 0b00010000 // interface
+#define TYPE_G  0x20 // 0b00100000 // gas
+#define TYPE_X  0x40 // 0b01000000 // reserved type X
+#define TYPE_Y  0x80 // 0b10000000 // reserved type Y
+
+#define TYPE_MS 0x03 // 0b00000011 // cell next to moving solid boundary
+#define TYPE_BO 0x03 // 0b00000011 // any flag bit used for boundaries (temperature excluded)
+#define TYPE_IF 0x18 // 0b00011000 // change from interface to fluid
+#define TYPE_IG 0x30 // 0b00110000 // change from interface to gas
+#define TYPE_GI 0x38 // 0b00111000 // change from gas to interface
+#define TYPE_SU 0x38 // 0b00111000 // any flag bit used for SURFACE
+
+#define def_n 1.333f
+#define GRAPHICS_RAYTRACING_COLOR 0x005F7F
+#define def_absorption_color vec4(0.0f, 95.0f / 255.0f, 127.0f / 255.0f, 1.0f)
+
+struct Ray {
+    vec3 ori;
+    vec3 dir;
+};
+
+layout(binding = 1, rgba8) uniform writeonly image2D outputImage;
+
+layout(binding = 2) uniform samplerCube skyboxSampler;
+
+layout(std430, binding = 3) buffer Phi {
+    float phis[];
+};
+
+layout(std430, binding = 4) buffer Flag {
+	uint flags[];
+};
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+float def_attenuation = log(renderUbo.transmittance) / float(max(max(renderUbo.Nx, renderUbo.Ny), renderUbo.Nz));
+
+float acospi(float x) {
+	return acos(x) / 3.1415926535f;
+}
+
+float sq(float x) {
+	return x * x;
+}
+
+float cb(float x) {
+	return pow(x, 3);
+}
+
+vec4 color_mix(vec4 c1, vec4 c2, const float w) {
+	return c1 * w + c2 * (1 - w);
+	//return vec4(c1.x * w + c2.x * (1 - w), c1.y * w + c2.y * (1 - w), c1.z * w + c2.z * (1 - w), 0.0f);
+}
+
+vec3 trilinear3(const vec3 p, inout vec3 v[8]) { // trilinear interpolation, p: position in unit cube, v: corner vectors in unit cube
+	const float x1 = p.x, y1 = p.y, z1 = p.z, x0 = 1.0f - x1, y0 = 1.0f - y1, z0 = 1.0f - z1; // calculate interpolation factors
+	return (x0 * y0 * z0) * v[0] + (x1 * y0 * z0) * v[1] + (x1 * y0 * z1) * v[2] + (x0 * y0 * z1) * v[3] + (x0 * y1 * z0) * v[4] + (x1 * y1 * z0) * v[5] + (x1 * y1 * z1) * v[6] + (x0 * y1 * z1) * v[7]; // perform trilinear interpolation
+}
+
+float interpolate(const float v1, const float v2, const float iso) { // linearly interpolate position where isosurface cuts an edge between 2 vertices at 0 and 1
+	return (iso - v1) / (v2 - v1);
+}
+
+uint triangle_table_data[1920] = { // source: Paul Bourke, http://paulbourke.net/geometry/polygonise/, termination value 15, bit packed
+	255u,255u,255u,255u,255u,255u,255u, 15u, 56u,255u,255u,255u,255u,255u,255u, 16u,249u,255u,255u,255u,255u,255u, 31u, 56u,137u,241u,255u,255u,255u,255u, 33u,250u,255u,255u,255u,255u,255u, 15u, 56u, 33u,250u,255u,255u,255u,255u, 41u, 10u,146u,
+	255u,255u,255u,255u, 47u, 56u,162u,168u,137u,255u,255u,255u,179u,242u,255u,255u,255u,255u,255u, 15u, 43u,184u,240u,255u,255u,255u,255u,145u, 32u,179u,255u,255u,255u,255u, 31u, 43u,145u,155u,184u,255u,255u,255u,163u,177u, 58u,255u,255u,255u,
+	255u, 15u, 26u,128u,138u,171u,255u,255u,255u,147u, 48u,155u,171u,249u,255u,255u,159u,168u,138u,251u,255u,255u,255u,255u,116u,248u,255u,255u,255u,255u,255u, 79u,  3u, 55u,244u,255u,255u,255u,255u, 16u,137u,116u,255u,255u,255u,255u, 79u,145u,
+	116u,113u, 19u,255u,255u,255u, 33u,138u,116u,255u,255u,255u,255u, 63u,116u,  3u, 20u,162u,255u,255u,255u, 41u,154u, 32u, 72u,247u,255u,255u, 47u,154u,146u, 39u, 55u,151u,244u,255u, 72u, 55u, 43u,255u,255u,255u,255u,191u,116u, 43u, 36u, 64u,
+	255u,255u,255u,  9u,129u,116u, 50u,251u,255u,255u, 79u,183u, 73u,155u, 43u, 41u,241u,255u,163u, 49u,171u,135u,244u,255u,255u, 31u,171u, 65u, 27u, 64u,183u,244u,255u,116u,152u,176u,185u,186u, 48u,255u, 79u,183u,180u,153u,171u,255u,255u,255u,
+	 89u,244u,255u,255u,255u,255u,255u,159u, 69u,128u,243u,255u,255u,255u,255u, 80u, 20u,  5u,255u,255u,255u,255u,143u, 69u, 56u, 53u, 81u,255u,255u,255u, 33u,154u, 69u,255u,255u,255u,255u, 63u,128u, 33u, 74u, 89u,255u,255u,255u, 37u, 90u, 36u,
+	  4u,242u,255u,255u, 47u, 90u, 35u, 53u, 69u, 67u,248u,255u, 89u, 36u,179u,255u,255u,255u,255u, 15u, 43u,128u, 75u, 89u,255u,255u,255u, 80u,  4u, 81u, 50u,251u,255u,255u, 47u, 81u, 82u, 40u,184u,132u,245u,255u, 58u,171u, 49u, 89u,244u,255u,
+	255u, 79u, 89u,128u,129u, 26u,184u,250u,255u, 69u, 80u,176u,181u,186u, 48u,255u, 95u,132u,133u,170u,184u,255u,255u,255u,121u, 88u,151u,255u,255u,255u,255u,159u,  3u, 89u, 83u, 55u,255u,255u,255u,112u,  8u,113u, 81u,247u,255u,255u, 31u, 53u,
+	 83u,247u,255u,255u,255u,255u,121u,152u,117u, 26u,242u,255u,255u,175u, 33u, 89u, 80u,  3u,117u,243u,255u,  8u,130u, 82u, 88u,167u, 37u,255u, 47u, 90u, 82u, 51u,117u,255u,255u,255u,151u,117u,152u,179u,242u,255u,255u,159u,117u,121u,146u,  2u,
+	114u,251u,255u, 50u, 11u,129u,113u, 24u,117u,255u,191u, 18u, 27u,119u, 81u,255u,255u,255u, 89u,136u,117u, 26u,163u,179u,255u, 95u,  7u,  5u,121u, 11u,  1u,186u, 10u,171u,176u, 48u, 90u,128u,112u,117u,176u, 90u,183u,245u,255u,255u,255u,255u,
+	106u,245u,255u,255u,255u,255u,255u, 15u, 56u,165u,246u,255u,255u,255u,255u,  9u, 81u,106u,255u,255u,255u,255u, 31u, 56u,145u, 88u,106u,255u,255u,255u, 97u, 37u, 22u,255u,255u,255u,255u, 31u, 86u, 33u, 54u,128u,255u,255u,255u,105u,149u, 96u,
+	 32u,246u,255u,255u, 95u,137u,133u, 82u, 98u, 35u,248u,255u, 50u,171u, 86u,255u,255u,255u,255u,191u,128u, 43u,160u, 86u,255u,255u,255u, 16u, 41u,179u,165u,246u,255u,255u, 95u,106u,145u,146u, 43u,137u,251u,255u, 54u,107u, 53u, 21u,243u,255u,
+	255u, 15u,184u,176u,  5u, 21u,181u,246u,255u,179u,  6u, 99u, 96u,  5u,149u,255u,111u,149u,150u,187u,137u,255u,255u,255u,165u, 70u,135u,255u,255u,255u,255u, 79u,  3u,116u, 99u,165u,255u,255u,255u,145u, 80u,106u, 72u,247u,255u,255u,175u, 86u,
+	145u, 23u, 55u,151u,244u,255u, 22u, 98u, 21u,116u,248u,255u,255u, 31u, 82u, 37u, 54u, 64u, 67u,247u,255u, 72u,151u, 80u, 96u,  5u, 98u,255u,127u,147u,151u, 52u,146u,149u, 38u,150u,179u,114u, 72u,106u,245u,255u,255u, 95u,106u,116u, 66u,  2u,
+	114u,251u,255u, 16u, 73u,135u, 50u, 91u,106u,255u,159u, 18u,185u,146u,180u,183u, 84u,106u, 72u, 55u, 91u, 83u, 81u,107u,255u, 95u,177u,181u, 22u,176u,183u,  4u,180u, 80u,  9u, 86u, 48u,182u, 54u, 72u,103u,149u,150u, 75u,151u,183u,249u,255u,
+	 74u,105u,164u,255u,255u,255u,255u, 79u,106u,148u, 10u, 56u,255u,255u,255u, 10u,161u,  6u, 70u,240u,255u,255u,143u, 19u, 24u,134u, 70u, 22u,250u,255u, 65u, 25u, 66u, 98u,244u,255u,255u, 63u,128u, 33u, 41u,148u, 98u,244u,255u, 32u, 68u, 98u,
+	255u,255u,255u,255u,143u, 35u, 40u, 68u, 98u,255u,255u,255u, 74u,169u, 70u, 43u,243u,255u,255u, 15u, 40u,130u, 75u,169u,164u,246u,255u,179u,  2u, 97u, 96u,100u,161u,255u,111u, 20u, 22u, 74u, 24u, 18u,139u, 27u,105u,148u, 99u, 25u,179u, 54u,
+	255u,143u, 27u, 24u,176u, 22u, 25u,100u, 20u,179u, 54u,  6u, 96u,244u,255u,255u,111u,132u,107u,248u,255u,255u,255u,255u,167u,118u,168u,152u,250u,255u,255u, 15u, 55u,160u,  7u,169u,118u,250u,255u,106u, 23u,122u,113u, 24u,  8u,255u,175u,118u,
+	122u, 17u, 55u,255u,255u,255u, 33u, 22u,134u,129u,137u,118u,255u, 47u,150u,146u, 97u,151u,144u,115u,147u,135u,112u, 96u,  6u,242u,255u,255u,127u, 35u,118u,242u,255u,255u,255u,255u, 50u,171u,134u,138u,137u,118u,255u, 47u,112u,114u, 11u,121u,
+	118u,154u,122u,129u, 16u,135u,161u,103u,167u, 50u,187u, 18u, 27u,167u, 22u,118u,241u,255u,152u,134u,118u, 25u,182u, 54u, 49u,  6u, 25u,107u,247u,255u,255u,255u,255u,135u,112u, 96u,179u,176u,  6u,255u,127u,107u,255u,255u,255u,255u,255u,255u,
+	103u,251u,255u,255u,255u,255u,255u, 63u,128u,123u,246u,255u,255u,255u,255u, 16u,185u,103u,255u,255u,255u,255u,143u,145u, 56u,177u,103u,255u,255u,255u, 26u, 98u,123u,255u,255u,255u,255u, 31u,162u,  3u,104u,123u,255u,255u,255u,146u, 32u,154u,
+	182u,247u,255u,255u,111u,123u,162u,163u, 56u,154u,248u,255u, 39u, 99u,114u,255u,255u,255u,255u,127u,128u,103u, 96u,  2u,255u,255u,255u,114u, 38u,115u, 16u,249u,255u,255u, 31u, 38u,129u, 22u,137u,120u,246u,255u,122u,166u,113u, 49u,247u,255u,
+	255u,175u,103u,113u, 26u,120u,  1u,248u,255u, 48u,  7u,167u,160u,105u,122u,255u,127u,166u,167u,136u,154u,255u,255u,255u,134u,180u,104u,255u,255u,255u,255u, 63u,182u,  3u,  6u,100u,255u,255u,255u,104u,139u,100u,  9u,241u,255u,255u,159u,100u,
+	105u,147u, 19u, 59u,246u,255u,134u,100u,139u,162u,241u,255u,255u, 31u,162u,  3u, 11u,182u, 64u,246u,255u,180u, 72u,182u, 32u, 41u,154u,255u,175u, 57u, 58u,146u, 52u, 59u, 70u, 54u, 40u,131u, 36u,100u,242u,255u,255u, 15u, 36u,100u,242u,255u,
+	255u,255u,255u,145u, 32u, 67u, 66u, 70u,131u,255u, 31u, 73u, 65u, 34u,100u,255u,255u,255u, 24u,131u, 22u, 72u,102u, 26u,255u,175u,  1u, 10u,102u, 64u,255u,255u,255u,100u, 67u,131u,166u,  3u,147u,154u,163u, 73u,166u,244u,255u,255u,255u,255u,
+	148u,117u,182u,255u,255u,255u,255u, 15u, 56u,148u,181u,103u,255u,255u,255u,  5u, 81u,  4u,103u,251u,255u,255u,191u,103u, 56u, 52u, 69u, 19u,245u,255u, 89u,164u, 33u,103u,251u,255u,255u,111u,123u, 33u, 10u, 56u,148u,245u,255u,103u, 91u,164u,
+	 36u, 74u, 32u,255u, 63u,132u, 83u, 52u, 82u, 90u,178u,103u, 39u,115u, 38u, 69u,249u,255u,255u,159u, 69u,128u,  6u, 38u,134u,247u,255u, 99u, 50u,103u, 81u, 80u,  4u,255u,111u,130u,134u, 39u,129u,132u, 21u,133u, 89u,164u, 97u,113u, 22u,115u,
+	255u, 31u,166u,113u, 22u,112u,120u,144u, 69u,  4u, 74u, 90u, 48u,106u,122u,115u,122u,166u,167u, 88u,164u,132u,250u,255u,150u,101u,155u,139u,249u,255u,255u, 63u,182u, 96u,  3u,101u,144u,245u,255u,176u,  8u,181u, 16u, 85u,182u,255u,111u, 59u,
+	 54u, 85u, 19u,255u,255u,255u, 33u,154u,181u,185u,184u,101u,255u, 15u, 59u, 96u, 11u,105u,101u, 25u,162u,139u,181u,101u,  8u,165u, 37u, 32u,101u, 59u, 54u, 37u, 58u, 90u,243u,255u,133u, 89u,130u,101u, 50u, 40u,255u,159u,101u,105u,  0u, 38u,
+	255u,255u,255u, 81u, 24u,  8u,101u, 56u, 40u, 38u, 24u,101u, 18u,246u,255u,255u,255u,255u, 49u, 22u,166u,131u, 86u,150u,152u,166u,  1u, 10u,150u,  5u,101u,240u,255u, 48u, 88u,166u,255u,255u,255u,255u,175u,101u,255u,255u,255u,255u,255u,255u,
+	 91u,122u,181u,255u,255u,255u,255u,191u,165u,123u,133u,  3u,255u,255u,255u,181u, 87u,186u,145u,240u,255u,255u,175u, 87u,186u,151u, 24u, 56u,241u,255u, 27u,178u, 23u, 87u,241u,255u,255u, 15u, 56u, 33u, 23u, 87u, 39u,251u,255u,121u,149u,114u,
+	  9u, 34u,123u,255u,127u, 37u, 39u, 91u, 41u, 35u,152u, 40u, 82u, 42u, 83u,115u,245u,255u,255u,143u,  2u, 88u,130u, 87u, 42u,245u,255u,  9u, 81u, 58u, 53u, 55u, 42u,255u,159u, 40u, 41u,129u, 39u, 42u,117u, 37u, 49u, 53u, 87u,255u,255u,255u,
+	255u, 15u,120u,112u, 17u, 87u,255u,255u,255u,  9u,147u, 83u, 53u,247u,255u,255u,159u,120u,149u,247u,255u,255u,255u,255u,133u, 84u,138u,186u,248u,255u,255u, 95u, 64u,181u, 80u,186u, 59u,240u,255u, 16u,137u,164u,168u,171u, 84u,255u,175u, 75u,
+	 74u,181u, 67u, 73u, 49u, 65u, 82u, 33u, 88u,178u, 72u,133u,255u, 15u,180u,176u, 67u,181u,178u, 81u,177u, 32u,  5u,149u,178u, 69u,133u,139u,149u, 84u,178u,243u,255u,255u,255u,255u, 82u, 58u, 37u, 67u, 53u, 72u,255u, 95u, 42u, 37u, 68u,  2u,
+	255u,255u,255u,163u, 50u,165u,131u, 69u,133u, 16u, 89u, 42u, 37u, 20u, 41u, 73u,242u,255u, 72u,133u, 53u, 83u,241u,255u,255u, 15u, 84u,  1u,245u,255u,255u,255u,255u, 72u,133u, 53u,  9u,  5u, 83u,255u,159u, 84u,255u,255u,255u,255u,255u,255u,
+	180u, 71u,185u,169u,251u,255u,255u, 15u, 56u,148u,151u,123u,169u,251u,255u,161u, 27u, 75u, 65u,112u,180u,255u, 63u, 65u, 67u, 24u, 74u, 71u,171u, 75u,180u,151u, 75u, 41u,155u, 33u,255u,159u, 71u,185u,151u,177u,178u,  1u, 56u,123u,180u, 36u,
+	 66u,240u,255u,255u,191u, 71u, 75u,130u, 67u, 35u,244u,255u,146u, 42u,151u, 50u,119u,148u,255u,159u,122u,121u,164u,114u,120u, 32u,112u,115u, 58u, 42u, 71u, 26u, 10u,  4u, 26u, 42u,120u,244u,255u,255u,255u,255u,148u, 65u,113u, 23u,243u,255u,
+	255u, 79u, 25u, 20u,  7u, 24u,120u,241u,255u,  4u,115u, 52u,255u,255u,255u,255u, 79u,120u,255u,255u,255u,255u,255u,255u,169u,168u,139u,255u,255u,255u,255u, 63u,144u,147u,187u,169u,255u,255u,255u, 16u, 10u,138u,168u,251u,255u,255u, 63u,161u,
+	 59u,250u,255u,255u,255u,255u, 33u, 27u,155u,185u,248u,255u,255u, 63u,144u,147u, 27u,146u,178u,249u,255u, 32u,139u,176u,255u,255u,255u,255u, 63u,178u,255u,255u,255u,255u,255u,255u, 50u, 40u,168u,138u,249u,255u,255u,159u, 42u,144u,242u,255u,
+	255u,255u,255u, 50u, 40u,168u, 16u, 24u,138u,255u, 31u, 42u,255u,255u,255u,255u,255u,255u, 49u,152u,129u,255u,255u,255u,255u, 15u, 25u,255u,255u,255u,255u,255u,255u, 48u,248u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u,255u
+};
+
+uint triangle_table(const uint i) {
+	return (triangle_table_data[i / 2u] >> (4u * (i % 2u))) & 0xF;
+}
+
+uint marching_cubes(const float vals[8], const float iso, inout vec3 triangles[15]) { // input: 8 values vals, isovalue; output: returns number of triangles, 15 triangle vertices t
+	uint cube = 0u; // determine index of which vertices are inside of the isosurface
+	for (uint i = 0u; i < 8u; i++) cube |= (vals[i] < iso ? 1 : 0) << i;
+	if (cube == 0u || cube == 255u) return 0u; // cube is entirely inside/outside of the isosurface
+	vec3 vertex[12]; // find the vertices where the surface intersects the cube
+	vertex[0] = vec3(interpolate(vals[0], vals[1], iso), 0.0f, 0.0f); // interpolate vertices on all 12 edges
+	vertex[1] = vec3(1.0f, 0.0f, interpolate(vals[1], vals[2], iso)); // do interpolation only in 1D to reduce operations
+	vertex[2] = vec3(interpolate(vals[3], vals[2], iso), 0.0f, 1.0f);
+	vertex[3] = vec3(0.0f, 0.0f, interpolate(vals[0], vals[3], iso));
+	vertex[4] = vec3(interpolate(vals[4], vals[5], iso), 1.0f, 0.0f);
+	vertex[5] = vec3(1.0f, 1.0f, interpolate(vals[5], vals[6], iso));
+	vertex[6] = vec3(interpolate(vals[7], vals[6], iso), 1.0f, 1.0f);
+	vertex[7] = vec3(0.0f, 1.0f, interpolate(vals[4], vals[7], iso));
+	vertex[8] = vec3(0.0f, interpolate(vals[0], vals[4], iso), 0.0f);
+	vertex[9] = vec3(1.0f, interpolate(vals[1], vals[5], iso), 0.0f);
+	vertex[10] = vec3(1.0f, interpolate(vals[2], vals[6], iso), 1.0f);
+	vertex[11] = vec3(0.0f, interpolate(vals[3], vals[7], iso), 1.0f);
+	cube *= 15u;
+	uint i; // number of triangle vertices
+	for (i = 0u; i < 15u && triangle_table(cube + i) != 15u; i += 3u) { // create the triangles
+		triangles[i] = vertex[triangle_table(cube + i)];
+		triangles[i + 1u] = vertex[triangle_table(cube + i + 1u)];
+		triangles[i + 2u] = vertex[triangle_table(cube + i + 2u)];
+	}
+	return i / 3u; // return number of triangles
+}
+
+vec3 myReflect(const vec3 direction, const vec3 normal) {
+	return direction-2.0f*dot(direction, normal)*normal;
+}
+
+vec3 myRefract(const vec3 direction, const vec3 normal, const float n) {
+	const float direction_normal = dot(direction, normal);
+	const float sqrt_part = sq(n)-1.0f+sq(direction_normal);
+	return sqrt_part>=0.0f ? (direction-(direction_normal+sqrt(sqrt_part))*normal)/n : direction-2.0f*direction_normal*normal; // refraction : total internal reflection
+}
+
+float intersect_rhombus(const Ray r, const vec3 p0, const vec3 p1, const vec3 p2) { // Moeller-Trumbore algorithm
+	const vec3 u = p1 - p0, v = p2 - p0, w = r.ori - p0, h = cross(r.dir, v), q = cross(w, u);
+	const float g = dot(u, h), f = 1.0f / g, s = f * dot(w, h), t = f * dot(r.dir, q);
+	return (g <= 0.0f || s < -0.0001f || s>1.0001f || t < -0.0001f || t>1.0001f) ? -1.0f : f * dot(v, q); // add tolerance values to avoid graphical artifacts with axis-aligned camera
+}
+
+float intersect_triangle_bidirectional(const Ray r, const vec3 p0, const vec3 p1, const vec3 p2) { // Moeller-Trumbore algorithm
+	const vec3 u = p1 - p0, v = p2 - p0, w = r.ori - p0, h = cross(r.dir, v), q = cross(w, u);
+	const float g = dot(u, h), f = 1.0f / g, s = f * dot(w, h), t = f * dot(r.dir, q);
+	return (g == 0.0f || s < -0.0001f || s>1.0001f || t < -0.0001f || s + t>1.0001f) ? -1.0f : f * dot(v, q); // add tolerance values to avoid graphical artifacts with axis-aligned camera
+}
+
+float intersect_cuboid_inside_with_normal(const Ray r, const vec3 center, const float Lx, const float Ly, const float Lz, inout vec3 normal) {
+	const vec3 bmin = center - 0.5f * vec3(Lx, Ly, Lz);
+	const vec3 bmax = center + 0.5f * vec3(Lx, Ly, Lz);
+	vec3 p[8]; // 8 cuboid vertices
+	p[0] = vec3(bmin.x, bmin.y, bmin.z); // ---
+	p[1] = vec3(bmax.x, bmin.y, bmin.z); // +--
+	p[2] = vec3(bmax.x, bmin.y, bmax.z); // +-+
+	p[3] = vec3(bmin.x, bmin.y, bmax.z); // --+
+	p[4] = vec3(bmin.x, bmax.y, bmin.z); // -+-
+	p[5] = vec3(bmax.x, bmax.y, bmin.z); // ++-
+	p[6] = vec3(bmax.x, bmax.y, bmax.z); // +++
+	p[7] = vec3(bmin.x, bmax.y, bmax.z); // -++
+	float intersect = -1.0f; // test for intersections with the 6 cuboid faces
+	float rhombus_intersect[6];
+	rhombus_intersect[0] = intersect_rhombus(r, p[2], p[6], p[1]); // +00 (normal vectors, points 2 and 3 are switched here to flip rhombus around)
+	rhombus_intersect[1] = intersect_rhombus(r, p[0], p[4], p[3]); // -00
+	rhombus_intersect[2] = intersect_rhombus(r, p[7], p[4], p[6]); // 0+0
+	rhombus_intersect[3] = intersect_rhombus(r, p[1], p[0], p[2]); // 0-0
+	rhombus_intersect[4] = intersect_rhombus(r, p[3], p[7], p[2]); // 00+
+	rhombus_intersect[5] = intersect_rhombus(r, p[1], p[5], p[0]); // 00-
+	uint side = 0u; // test for intersections with the 6 cuboid faces
+	for (uint i = 0u; i < 6u; i++) {
+		if (rhombus_intersect[i] > intersect) { // test for intersections with the 6 cuboid faces
+			intersect = rhombus_intersect[i]; // ray will intersect with either 0 or 1 rhombuses
+			side = i;
+		}
+	}
+	normal = normalize(vec3(side == 0u ? 1.0f : side == 1u ? -1.0f : 0.0f, side == 2u ? 1.0f : side == 3u ? -1.0f : 0.0f, side == 4u ? 1.0f : side == 5u ? -1.0f : 0.0f));
+	return intersect;
+}
+
+Ray getCameraRay(const ivec2 pixelCoords, const ivec2 imageSize) {
+
+    // 1. 将像素坐标归一化到 [-1, 1] 的 NDC 空间
+    vec2 screenUV = (vec2(pixelCoords) + 0.5f) / vec2(imageSize);
+    vec2 ndc = screenUV * 2.0f - 1.0f;
+
+    // 2. 创建一个 NDC 坐标的齐次向量
+    vec4 screenPos = vec4(ndc.x, ndc.y, 1.0f, 1.0f);
+
+    // 将屏幕空间坐标通过逆投影矩阵转换到相机局部空间
+    vec4 localRayDir = renderUbo.invProj * screenPos;
+
+    // 将相机局部空间中的方向向量转换到世界空间
+    vec3 worldRayDir = normalize(localRayDir.x * vec3(renderUbo.invView[0]) +
+                                 localRayDir.y * vec3(renderUbo.invView[1]) +
+                                 localRayDir.z * vec3(renderUbo.invView[2]));
+
+    // 射线原点就是相机在世界空间中的位置
+    vec3 rayOrigin = renderUbo.cameraPos;
+
+    return Ray(rayOrigin, worldRayDir);
+}
+
+vec4 getSkyBoxColor(const vec3 dir) {
+    return texture(skyboxSampler, vec3(dir.x, dir.z, -dir.y));
+}
+
+float intersect_cuboid(const Ray r, const vec3 center, const float Lx, const float Ly, const float Lz) {
+	const vec3 bmin = center - 0.5f * vec3(Lx, Ly, Lz);
+	const vec3 bmax = center + 0.5f * vec3(Lx, Ly, Lz);
+	if (r.ori.x >= bmin.x && r.ori.y >= bmin.y && r.ori.z >= bmin.z && r.ori.x <= bmax.x && r.ori.y <= bmax.y && r.ori.z <= bmax.z) return 0.0f; // ray origin is within cuboid
+	vec3 p[8]; // 8 cuboid vertices
+	p[0] = vec3(bmin.x, bmin.y, bmin.z); // ---
+	p[1] = vec3(bmax.x, bmin.y, bmin.z); // +--
+	p[2] = vec3(bmax.x, bmin.y, bmax.z); // +-+
+	p[3] = vec3(bmin.x, bmin.y, bmax.z); // --+
+	p[4] = vec3(bmin.x, bmax.y, bmin.z); // -+-
+	p[5] = vec3(bmax.x, bmax.y, bmin.z); // ++-
+	p[6] = vec3(bmax.x, bmax.y, bmax.z); // +++
+	p[7] = vec3(bmin.x, bmax.y, bmax.z); // -++
+	float intersect = -1.0f; // test for intersections with the 6 cuboid faces, ray will intersect with either 0 or 1 rhombuses
+	intersect = max(intersect, intersect_rhombus(r, p[0], p[3], p[4])); // +00 (normal vectors)
+	intersect = max(intersect, intersect_rhombus(r, p[2], p[1], p[6])); // -00
+	intersect = max(intersect, intersect_rhombus(r, p[1], p[2], p[0])); // 0+0
+	intersect = max(intersect, intersect_rhombus(r, p[7], p[6], p[4])); // 0-0
+	intersect = max(intersect, intersect_rhombus(r, p[1], p[0], p[5])); // 00+
+	intersect = max(intersect, intersect_rhombus(r, p[3], p[2], p[7])); // 00-
+	return intersect;
+}
+
+float intersect_cuboid_slab(const Ray r, const vec3 center, const float Lx, const float Ly, const float Lz) {
+	const vec3 bmin = center - 0.5f * vec3(Lx, Ly, Lz);
+	const vec3 bmax = center + 0.5f * vec3(Lx, Ly, Lz);
+	if (r.ori.x>=bmin.x&&r.ori.x<=bmax.x &&r.ori.y>= bmin.y&& r.ori.y<= bmax.y &&r.ori.z>= bmin.z&& r.ori.z<= bmax.z) return 0.0f;
+	const float dx = r.dir.x, dy = r.dir.y, dz = r.dir.z;
+	float t_xmin, t_xmax, t_ymin, t_ymax, t_zmin, t_zmax;
+
+	if (dx == 0.0f) {
+		if (r.ori.x < bmin.x || r.ori.x > bmax.x) {
+			return -1.0f;
+		}
+		t_xmin = -1e30f;
+		t_xmax = 1e30f;
+	}
+	else {
+		const float tx1 = (bmin.x - r.ori.x) / dx;
+		const float tx2 = (bmax.x - r.ori.x) / dx;
+		if (tx1 < tx2) {
+			t_xmin = tx1;
+			t_xmax = tx2;
+		}
+		else {
+			t_xmin = tx2;
+			t_xmax = tx1;
+		}
+	}
+	if (dy == 0.0f) {
+		if (r.ori.y < bmin.y || r.ori.y > bmax.y) {
+			return -1.0f;
+		}
+		t_ymin = -1e30f;
+		t_ymax = 1e30f;
+	}
+	else {
+		const float ty1 = (bmin.y - r.ori.y) / dy;
+		const float ty2 = (bmax.y - r.ori.y) / dy;
+		if (ty1 < ty2) {
+			t_ymin = ty1;
+			t_ymax = ty2;
+		}
+		else {
+			t_ymin = ty2;
+			t_ymax = ty1;
+		}
+	}
+	if (dz == 0.0f) {
+		if (r.ori.z < bmin.z || r.ori.z > bmax.z) {
+			return -1.0f;
+		}
+		t_zmin = -1e30f;
+		t_zmax = 1e30f;
+	}
+	else {
+		const float tz1 = (bmin.z - r.ori.z) / dz;
+		const float tz2 = (bmax.z - r.ori.z) / dz;
+		if (tz1 < tz2) {
+			t_zmin = tz1;
+			t_zmax = tz2;
+		}
+		else {
+			t_zmin = tz2;
+			t_zmax = tz1;
+		}
+	}
+
+	const float t_enter = max(max(t_xmin, t_ymin), t_zmin);
+	const float t_exit  = min(min(t_xmax, t_ymax), t_zmax);
+
+	if (t_enter < t_exit && t_exit > 0.0f) {
+		return (t_enter > 0.0f) ? t_enter : 0.0f;
+	}
+	return -1.0f;
+}
+
+float interpolate_phi(const vec3 p, const uint Nx, const uint Ny, const uint Nz) { // trilinear interpolation of velocity at point p
+	const float xa = p.x - 0.5f + 1.5f * float(Nx), ya = p.y - 0.5f + 1.5f * float(Ny), za = p.z - 0.5f + 1.5f * float(Nz); // subtract lattice offsets
+	const uint xb = uint(xa), yb = uint(ya), zb = uint(za); // integer casting to find bottom left corner
+	const float x1 = xa - float(xb), y1 = ya - float(yb), z1 = za - float(zb), x0 = 1.0f - x1, y0 = 1.0f - y1, z0 = 1.0f - z1; // calculate interpolation factors
+	float phin[8]; // phi at unit cube corner points
+	for (uint c = 0u; c < 8u; c++) { // count over eight corner points
+		const uint i = (c & 0x04u) >> 2, j = (c & 0x02u) >> 1, k = c & 0x01u; // disassemble c into corner indices ijk
+		const uint x = (xb + i) % Nx, y = (yb + j) % Ny, z = (zb + k) % Nz; // calculate corner lattice positions
+		const uint n = x + (y + z * Ny) * Nx; // calculate lattice linear index
+		phin[c] = phis[n]; // load velocity from lattice point
+	}
+	return (x0 * y0 * z0) * phin[0] + (x0 * y0 * z1) * phin[1] + (x0 * y1 * z0) * phin[2] + (x0 * y1 * z1) * phin[3] + (x1 * y0 * z0) * phin[4] + (x1 * y0 * z1) * phin[5] + (x1 * y1 * z0) * phin[6] + (x1 * y1 * z1) * phin[7]; // perform trilinear interpolation
+}
+
+float ray_grid_traverse(const Ray r, inout vec3 normal, const uint Nx, const uint Ny, const uint Nz) {
+	const vec3 p = vec3(r.ori.x - 0.5f + 0.5f * float(Nx), r.ori.y - 0.5f + 0.5f * float(Ny), r.ori.z - 0.5f + 0.5f * float(Nz)); // start point
+	const int dx = int(sign(r.dir.x)), dy = int(sign(r.dir.y)), dz = int(sign(r.dir.z)); // fast ray-grid-traversal
+	ivec3 xyz = ivec3(floor(p.x), floor(p.y), floor(p.z));
+	const float fxa = p.x - floor(p.x), fya = p.y - floor(p.y), fza = p.z - floor(p.z);
+	const float tdx = 1.0f / max(abs(r.dir.x), 1E-6f);
+	const float tdy = 1.0f / max(abs(r.dir.y), 1E-6f);
+	const float tdz = 1.0f / max(abs(r.dir.z), 1E-6f);
+	float tmx = tdx * (dx > 0 ? 1.0f - fxa : dx < 0 ? fxa : 0.0f);
+	float tmy = tdy * (dy > 0 ? 1.0f - fya : dy < 0 ? fya : 0.0f);
+	float tmz = tdz * (dz > 0 ? 1.0f - fza : dz < 0 ? fza : 0.0f);
+	for (uint tc = 0u; tc < Nx + Ny + Nz; tc++) { // limit number of traversed cells to space diagonal
+		if (tmx < tmy) { if (tmx < tmz) { xyz.x += dx; tmx += tdx; } else { xyz.z += dz; tmz += tdz; } }
+		else /****/ { if (tmy < tmz) { xyz.y += dy; tmy += tdy; } else { xyz.z += dz; tmz += tdz; } }
+		if (xyz.x < -1 || xyz.y < -1 || xyz.z < -1 || xyz.x >= int(Nx) || xyz.y >= int(Ny) || xyz.z >= int(Nz)) break; // out of simulation box
+		else if (xyz.x < 0 || xyz.y < 0 || xyz.z < 0 || xyz.x >= int(Nx) - 1 || xyz.y >= int(Ny) - 1 || xyz.z >= int(Nz) - 1) continue;
+		const uint x0 = uint(xyz.x); // cube stencil
+		const uint xp = uint(xyz.x) + 1u;
+		const uint y0 = uint(uint(xyz.y) * Nx);
+		const uint yp = uint(((uint(xyz.y) + 1u) * Nx));
+		const uint z0 = uint(uint(xyz.z) * (Ny * Nx));
+		const uint zp = uint((uint(xyz.z) + 1u) * (Ny * Nx));
+		uint j[8];
+		j[0] = x0 + y0 + z0; // 000
+		j[1] = xp + y0 + z0; // +00
+		j[2] = xp + y0 + zp; // +0+
+		j[3] = x0 + y0 + zp; // 00+
+		j[4] = x0 + yp + z0; // 0+0
+		j[5] = xp + yp + z0; // ++0
+		j[6] = xp + yp + zp; // +++
+		j[7] = x0 + yp + zp; // 0++
+		uint flags_cell = 0u; // check with cheap flags if the isosurface goes through the current marching-cubes cell (~15% performance boost)
+		for (uint i = 0u; i < 8u; i++) flags_cell |= flags[j[i]];
+		if (!((flags_cell & (TYPE_S | TYPE_E | TYPE_I)) != 0)) continue; // cell is entirely inside/outside of the isosurface
+		float v[8];
+		for (uint i = 0u; i < 8u; i++) v[i] = phis[j[i]];
+		vec3 triangles[15]; // maximum of 5 triangles with 3 vertices each
+		const uint tn = marching_cubes(v, 0.5f, triangles); // run marching cubes algorithm
+		if (tn == 0u) continue; // if returned tn value is non-zero, iterate through triangles
+		const vec3 offset = vec3(float(xyz.x) + 0.5f - 0.5f * float(Nx), float(xyz.y) + 0.5f - 0.5f * float(Ny), float(xyz.z) + 0.5f - 0.5f * float(Nz));
+		for (uint i = 0u; i < tn; i++) {
+			const vec3 p0 = triangles[3u * i] + offset;
+			const vec3 p1 = triangles[3u * i + 1u] + offset;
+			const vec3 p2 = triangles[3u * i + 2u] + offset;
+			const float intersect = intersect_triangle_bidirectional(r, p0, p1, p2); // for each triangle, check ray-triangle intersection
+			if (intersect > 0.0f) { // intersection found (there can only be exactly 1 intersection)
+				const uint xq = ((uint(xyz.x) + 2u) % Nx); // central difference stencil on each cube corner point
+				const uint xm = ((uint(xyz.x) + Nx - 1u) % Nx);
+				const uint yq = (((uint(xyz.y) + 2u) % Ny) * Nx);
+				const uint ym = (((uint(xyz.y) + Ny - 1u) % Ny) * Nx);
+				const uint zq = ((uint(xyz.z) + 2u) % Nz) * (Ny * Nx);
+				const uint zm = ((uint(xyz.z) + Nz - 1u) % Nz) * (Ny * Nx);
+				vec3 n[8];
+				n[0] = vec3(phis[xm + y0 + z0] - v[1], phis[x0 + ym + z0] - v[4], phis[x0 + y0 + zm] - v[3]); // central difference stencil on each cube corner point
+				n[1] = vec3(v[0] - phis[xq + y0 + z0], phis[xp + ym + z0] - v[5], phis[xp + y0 + zm] - v[2]); // compute normal vectors from gradient
+				n[2] = vec3(v[3] - phis[xq + y0 + zp], phis[xp + ym + zp] - v[6], v[1] - phis[xp + y0 + zq]); // normalize later after trilinear interpolation
+				n[3] = vec3(phis[xm + y0 + zp] - v[2], phis[x0 + ym + zp] - v[7], v[0] - phis[x0 + y0 + zq]);
+				n[4] = vec3(phis[xm + yp + z0] - v[5], v[0] - phis[x0 + yq + z0], phis[x0 + yp + zm] - v[7]);
+				n[5] = vec3(v[4] - phis[xq + yp + z0], v[1] - phis[xp + yq + z0], phis[xp + yp + zm] - v[6]);
+				n[6] = vec3(v[7] - phis[xq + yp + zp], v[2] - phis[xp + yq + zp], v[5] - phis[xp + yp + zq]);
+				n[7] = vec3(phis[xm + yp + zp] - v[6], v[3] - phis[x0 + yq + zp], v[4] - phis[x0 + yp + zq]);
+				const vec3 p = r.ori + intersect * r.dir - offset; // intersection point minus offset
+				normal = normalize(trilinear3(p - floor(p), n)); // perform trilinear interpolation and normalization
+				return intersect; // intersection found, exit loop
+			}
+		}
+	}
+	const float intersect = intersect_cuboid_inside_with_normal(r, vec3(0.0f, 0.0f, 0.0f), float(Nx) - 1.0f, float(Ny) - 1.0f, float(Nz) - 1.0f, normal); // -1 because marching-cubes surface ends between cells
+	return intersect > 0.0f ? (interpolate_phi(r.ori + intersect * r.dir, Nx, Ny, Nz) > 0.5f ? intersect : -1.0f) : -1.0f; // interpolate phi at ray intersection point with simulation box, to check if ray is inside fluid
+}
+
+bool raytrace_phi(const Ray ray_in, inout Ray ray_reflect, inout Ray ray_transmit, inout float reflectivity, inout float transmissivity, const uint Nx, const uint Ny, const uint Nz) {
+	vec3 normal;
+	float d = ray_grid_traverse(ray_in, normal, Nx, Ny, Nz); // move ray through lattice, at each cell call marching_cubes
+	if (d == -1.0f) return false; // no intersection found
+	const float ray_in_normal = dot(ray_in.dir, normal);
+	const bool is_inside = ray_in_normal > 0.0f; // camera is in fluid
+	ray_reflect.ori = ray_in.ori + (d - 0.005f) * ray_in.dir; // start intersection points a bit in front triangle to avoid self-reflection
+	ray_reflect.dir = myReflect(ray_in.dir, normal); // compute reflection ray
+	Ray ray_internal; // compute internal ray and transmission ray
+	ray_internal.ori = ray_in.ori + (d + 0.005f) * ray_in.dir; // start intersection points a bit behind triangle to avoid self-transmission
+	ray_internal.dir = myRefract(ray_in.dir, normal, def_n);
+	const float wr = clamp(sq(cb(2.0f * acospi(abs(ray_in_normal)))), 0.0f, 1.0f); // increase reflectivity if ray intersects surface at shallow angle
+	if (is_inside) { // swap ray_reflect and ray_internal
+		const vec3 ray_internal_origin = ray_internal.ori;
+		ray_internal.ori = ray_reflect.ori;
+		ray_internal.dir = ray_reflect.dir;
+		ray_reflect.ori = ray_internal_origin; // re-use internal ray ori
+		ray_reflect.dir = myRefract(ray_in.dir, -normal, 1.0f / def_n); // compute refraction again: myRefract out of fluid
+		if (sq(1.0f / def_n) - 1.0f + sq(ray_in_normal) >= 0.0f) { // refraction through Snell's window
+			ray_transmit.ori = ray_reflect.ori; // reflection ray and transmission ray are the same
+			ray_transmit.dir = ray_reflect.dir;
+			reflectivity = 0.0f;
+			transmissivity = exp(def_attenuation * d); // Beer-Lambert law
+			return true;
+		}
+	}
+	float d_internal = d;
+	d = ray_grid_traverse(ray_internal, normal, Nx, Ny, Nz); // 2nd ray-grid traversal call: refraction (camera outside) or total internal reflection (camera inside)
+	ray_transmit.ori = d != -1.0f ? ray_internal.ori + (d + 0.005f) * ray_internal.dir : ray_internal.ori; // start intersection points a bit behind triangle to avoid self-transmission
+	ray_transmit.dir = d != -1.0f || is_inside ? myRefract(ray_internal.dir, -normal, 1.0f / def_n) : ray_internal.dir; // internal ray intersects isosurface : internal ray does not intersect again
+	reflectivity = is_inside ? 0.0f : wr; // is_inside means camera is inside fluid, so this is a total internal reflection down here
+	transmissivity = d != -1.0f || is_inside ? exp(def_attenuation * (float(is_inside) * d_internal + d)) : float(def_attenuation == 0.0f); // Beer-Lambert law
+	return true;
+}
+
+vec4 last_ray(const Ray reflection, const Ray transmission, const float reflectivity, const float transmissivity) {
+	return color_mix(getSkyBoxColor(reflection.dir), color_mix(getSkyBoxColor(transmission.dir), def_absorption_color, transmissivity), reflectivity);
+}
+
+void main() 
+{
+    ivec2 pixelCoords = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 imageSize = ivec2(imageSize(outputImage));
+	if (pixelCoords.x > imageSize.x || pixelCoords.y > imageSize.y) return;
+
+    Ray camray = getCameraRay(pixelCoords, imageSize);
+    const float distance = intersect_cuboid_slab(camray, vec3(0.0f, 0.0f, 0.0f), renderUbo.Nx, renderUbo.Ny, renderUbo.Nz);
+	camray.ori = camray.ori+max(distance, 0.0f)*camray.dir;
+
+	Ray reflection, transmission; // reflection and transmission
+	float reflectivity, transmissivity;
+	vec4 finalColor;
+
+	if (distance < 0) {
+		finalColor = getSkyBoxColor(camray.dir);
+	}
+	else {
+		if (raytrace_phi(camray, reflection, transmission, reflectivity, transmissivity, renderUbo.Nx, renderUbo.Ny, renderUbo.Nz)) {
+			finalColor = last_ray(reflection, transmission, reflectivity, transmissivity); // 1 ray pass
+			//finalColor = raytrace_phi_next_ray(reflection, transmission, reflectivity, transmissivity, phi, flags, skybox); // 2 ray passes
+		}
+		else {
+			finalColor = getSkyBoxColor(camray.dir);
+		}
+	}
+
+    imageStore(outputImage, ivec2(gl_GlobalInvocationID.xy), finalColor);
+}

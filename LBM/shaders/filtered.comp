@@ -1,0 +1,165 @@
+#version 450
+layout(binding=0) uniform sampler2D old_depthtexture;
+layout(binding=1,r32f) uniform writeonly image2D filtered_depthtexture;
+
+// 优化：增加工作组大小以提高占有率 (通常8x8比4x4更适合现代GPU)
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+
+// 预定义常量
+const int r = 5;
+const float gaussian_factor = -0.03;
+const float depth_factor = -0.3;
+
+void main(){
+    ivec2 centerCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(filtered_depthtexture);
+    
+    if(centerCoord.x >= size.x || centerCoord.y >= size.y) return;
+
+    // 优化：直接使用 texelFetch 读取中心深度，无需 UV 计算
+    float centerDepth = texelFetch(old_depthtexture, centerCoord, 0).r;
+    
+    // 如果是背景(假设深度1.0为远平面)，可以提前跳过滤波，大幅节省性能
+    // 根据你的投影矩阵，如果背景是0或1，请自行调整
+    // if (centerDepth >= 0.999) { 
+    //     imageStore(filtered_depthtexture, centerCoord, vec4(centerDepth, 0, 0, 0)); 
+    //     return; 
+    // }
+
+    float wsum = 0.0;
+    float sum = 0.0;
+
+    // 优化：将边界限制在循环范围外，避免循环内判断
+    // 使用 clamp 保证采样坐标不越界
+    ivec2 minLimit = ivec2(0);
+    ivec2 maxLimit = size - ivec2(1);
+
+    for(int dy = -r; dy <= r; ++dy){
+        for(int dx = -r; dx <= r; ++dx){
+            
+            // 1. 计算采样坐标 (无分支边界处理)
+            ivec2 sampleCoord = clamp(centerCoord + ivec2(dx, dy), minLimit, maxLimit);
+            float d_d = texelFetch(old_depthtexture, sampleCoord, 0).r;
+
+            // 2. 预计算的空间权重逻辑 (移除 if 分支)
+            // 原逻辑：float coeff_c = gaussian_factor*(dx*dx+dy*dy);
+            float dist_sq = float(dx*dx + dy*dy);
+            
+            // 优化：将空间部分的 exp 计算合并。
+            // 只有深度差异部分需要在循环内做 exp，或者两者合并后做一次 exp
+            
+            // 你的特殊权重逻辑复刻（无分支化）：
+            // 原逻辑：if(abs(dx) > r*0.6 || abs(dy) > r*0.6) coeff *= 1.5;
+            float abs_dx = abs(float(dx));
+            float abs_dy = abs(float(dy));
+            float limit_06 = float(r) * 0.6;
+            float limit_04 = float(r) * 0.4;
+            
+            float boost = 1.0;
+            // 使用 step 替代 if: step(edge, x) -> 如果 x < edge 返回 0.0，否则 1.0
+            boost = mix(boost, boost * 1.5, step(limit_06, max(abs_dx, abs_dy)));
+            
+            // 原逻辑：if(abs(dx) > r*0.4 && abs(dy) > r*0.4) coeff *= 1.3;
+            // 只有当 dx 和 dy 都大于 0.4r 时触发
+            float diag_trigger = step(limit_04, abs_dx) * step(limit_04, abs_dy);
+            boost = mix(boost, boost * 1.3, diag_trigger);
+
+            // 3. 深度权重
+            // 优化：避免重复计算 (depth-d_d)
+            float diff = centerDepth - d_d;
+            float coeff_s = depth_factor * diff * diff; // 深度差异部分
+            float coeff_c = gaussian_factor * dist_sq;  // 空间距离部分
+
+            // 合并 exp 计算，减少指令数
+            float coeff = exp(coeff_c + coeff_s) * boost;
+
+            wsum += coeff;
+            sum += coeff * d_d;
+        }
+    }
+
+    // 防止除以0
+    if (wsum > 0.0001) {
+        sum /= wsum;
+    } else {
+        sum = centerDepth;
+    }
+    
+    float blend_factor = 0.95;
+    float finalDepth = mix(centerDepth, sum, blend_factor);
+    
+    imageStore(filtered_depthtexture, centerCoord, vec4(finalDepth, 0, 0, 0));
+}
+//#version 450
+//layout(binding=0) uniform sampler2D old_depthtexture;
+//layout(binding=1,r32f) uniform writeonly image2D filtered_depthtexture;
+//
+//layout(local_size_x=4,local_size_y=4,local_size_z=1) in;
+//
+//void main(){
+//    ivec2 outcoord = ivec2(gl_GlobalInvocationID.xy);
+//    ivec2 imagesize = imageSize(filtered_depthtexture);
+//    
+//    if(outcoord.x >= imagesize.x || outcoord.y >= imagesize.y) return;
+//
+//    float u = (outcoord.x + 0.5)/imagesize.x;
+//    float v = (outcoord.y + 0.5)/imagesize.y;
+//
+//    float depth = texture(old_depthtexture,vec2(u,v)).r;
+//    
+//    // 增大滤波半径，覆盖更大区域
+//    int r = 5;  // 从14增大到18，覆盖更大区域
+//    float wsum = 0;
+//    float sum = 0;
+//    
+//    // 高斯权重调节因子 - 降低此值会增强模糊效果
+//    float gaussian_factor = -0.03;  // 从-0.05降低到-0.03，加强模糊
+//    
+//    // 深度差异调节因子 - 增大此值可减弱边缘保留效果
+//    float depth_factor = -0.3;  // 从-0.6改为-0.3，减弱边缘保留
+//    
+//    for(float dx=-r;dx<=r;++dx){
+//        for(float dy=-r;dy<=r;++dy){
+//
+//            float u_d = u + dx/imagesize.x;
+//            float v_d = v + dy/imagesize.y;
+//            float d_d;
+//            if(u_d<0||u_d>1||v_d<0||v_d>1)
+//            {
+//                d_d = 1000;
+//            }
+//            else{
+//                d_d = texture(old_depthtexture,vec2(u_d,v_d)).r;
+//            }
+//            
+//            // 空间距离系数（高斯权重）
+//            float coeff_c = gaussian_factor*(dx*dx+dy*dy);
+//
+//            // 深度差异系数（双边滤波部分）
+//            float coeff_s = depth_factor*(depth-d_d)*(depth-d_d);
+//
+//            // 最终权重
+//            float coeff = exp(coeff_c+coeff_s);
+//            
+//            // 对离中心较远的点进行额外权重提升，更强调边缘平滑
+//            if(abs(dx) > r*0.6 || abs(dy) > r*0.6) {  // 从0.7降低到0.6
+//                coeff *= 1.5;  // 从1.2增加到1.5
+//            }
+//            
+//            // 额外增加对角线权重，增强圆润感
+//            if(abs(dx) > r*0.4 && abs(dy) > r*0.4) {
+//                coeff *= 1.3;  // 对角线位置加强权重
+//            }
+//
+//            wsum += coeff;
+//            sum += coeff*d_d;
+//        }
+//    }
+//    sum/=wsum;
+//    
+//    // 在中心深度和滤波结果之间进行一个额外的插值，控制滤波强度
+//    float blend_factor = 0.95;  // 从0.85增大到0.95，更倾向于使用滤波结果
+//    depth = mix(depth, sum, blend_factor);
+//    
+//    imageStore(filtered_depthtexture,outcoord,vec4(depth,0,0,0));
+//}

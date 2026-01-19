@@ -1,0 +1,22 @@
+#version 450
+layout(binding=0) uniform sampler2D srcImage;
+layout(binding=1, rgba8) uniform writeonly image2D dstImage;
+
+layout(local_size_x=16, local_size_y=16, local_size_z=1) in;
+
+vec4 upscale(sampler2D image, vec2 uv) {
+    return texture(image, uv);
+}
+
+void main(){
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstImage);
+    vec2 uv = pixelCoord / (dstSize - 1.0f);
+    if (pixelCoord.x >= dstSize.x || pixelCoord.y >= dstSize.y) {
+        return;
+    }
+    
+    vec4 color = upscale(srcImage, uv);
+    
+    imageStore(dstImage, pixelCoord, color);
+}

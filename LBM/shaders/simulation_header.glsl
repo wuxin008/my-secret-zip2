@@ -1,0 +1,893 @@
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_debug_printf : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define VOLUME_FORCE
+#define FORCE_FIELD
+//#define EQUILIBRIUM_BOUNDARIES
+#define MOVING_BOUNDARIES
+#define SUBGRID
+#define SURFACE
+//#define CURVATURE
+
+#define SRT
+//#define TRT
+
+#ifdef SURFACE
+#define UPDATE_FIELDS
+#endif
+
+#define D 3
+#define Q 19
+#define def_c 0.57735027f
+#define def_w0 (1.0f/3.0f ) // center (0)
+#define def_ws (1.0f/18.0f) // straight (1-6)
+#define def_we (1.0f/36.0f) // edge (7-18)
+#define def_Ox 0
+#define def_Oy 0
+#define def_Oz 0
+#define def_scale_F (0.5f/0.001f)
+
+#define TYPE_S  0x01 // 0b00000001 // (stationary or moving) solid boundary
+#define TYPE_E  0x02 // 0b00000010 // equilibrium boundary (inflow/outflow)
+#define TYPE_T  0x04 // 0b00000100 // temperature boundary
+#define TYPE_F  0x08 // 0b00001000 // fluid
+#define TYPE_I  0x10 // 0b00010000 // interface
+#define TYPE_G  0x20 // 0b00100000 // gas
+#define TYPE_X  0x40 // 0b01000000 // reserved type X
+#define TYPE_Y  0x80 // 0b10000000 // reserved type Y
+
+#define TYPE_MS 0x80 // 0b00000011 // cell next to moving solid boundary
+#define TYPE_BO 0x03 // 0b00000011 // any flag bit used for boundaries (temperature excluded)
+#define TYPE_IF 0x18 // 0b00011000 // change from interface to fluid
+#define TYPE_IG 0x30 // 0b00110000 // change from interface to gas
+#define TYPE_GI 0x38 // 0b00111000 // change from gas to interface
+#define TYPE_SU 0x38 // 0b00111000 // any flag bit used for SURFACE
+
+#define COLOR_S (127<<16|127<<8|127) // (stationary or moving) solid boundary
+#define COLOR_E (  0<<16|255<<8|  0) // equilibrium boundary (inflow/outflow)
+#define COLOR_M (255<<16|  0<<8|255) // cells next to moving solid boundary
+#define COLOR_T (255<<16|  0<<8|  0) // temperature boundary
+#define COLOR_F (  0<<16|  0<<8|255) // fluid
+#define COLOR_I (  0<<16|255<<8|255) // interface
+#define COLOR_0 (127<<16|127<<8|127) // regular cell or gas
+#define COLOR_X (255<<16|127<<8|  0) // reserved type X
+#define COLOR_Y (255<<16|255<<8|  0) // reserved type Y
+#define COLOR_P (255<<16|255<<8|191) // particles
+
+#define fma(a, b, c) ((a)*(b)+(c))
+#define rsqrt(x) (1 / sqrt(x))
+#define fdim(x, y) max((x) - (y), 0)
+#define copysign(x, y) ((y)!=0?abs(x)*sign(y):abs(x))
+#define load(p,o) p[o]
+#define store(p,o,x) p[o]=x
+const float w[Q] = {
+    1.0f / 3.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 18.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+    1.0f / 36.0f,
+};
+
+const ivec3 e[Q] = {
+    { 0,  0,  0},
+    { 1,  0,  0},
+    {-1,  0,  0},
+    { 0,  1,  0},
+    { 0, -1,  0},
+    { 0,  0,  1},
+    { 0,  0, -1},
+    { 1,  1,  0},
+    {-1, -1,  0},
+    { 1,  0,  1},
+    {-1,  0, -1},
+    { 0,  1,  1},
+    { 0, -1, -1},
+    { 1, -1,  0},
+    {-1,  1,  0},
+    { 1,  0, -1},
+    {-1,  0,  1},
+    { 0,  1, -1},
+    { 0, -1,  1},
+};
+
+const uint Q_LUT[27] = {
+	// x = -1
+	 8u,  8u,  8u, // y = -1
+	10u,  2u, 16u, // y =  0
+	14u, 14u, 14u,// y =  1
+	// x = 0
+	12u,  4u, 18u, // y = -1
+	 6u,  0u,  5u, // y =  0
+	17u,  3u, 11u,// y =  1
+	// x = 1
+	13u, 13u, 13u, // y = -1
+	15u,  1u,  9u, // y =  0
+	 7u,  7u,  7u,// y =  1
+};
+
+struct Vertex {
+    vec3 pos;
+    vec4 color;
+};
+
+struct Particle {
+    vec3 position;
+    vec4 color;
+};
+
+struct VkDrawIndirectCommand {
+	uint vertexCount;
+	uint instanceCount;
+	uint firstVertex;
+	uint firstInstance;
+};
+
+layout(std430, binding = 0) uniform SimulateUBO{
+    uint Nx;
+    uint Ny;
+    uint Nz;
+    uint Nxyz;
+    //uint particleCount;
+    float particleRho;
+    float niu;
+    float smoothness;
+    float tau;
+    float inv_tau;
+    float isoVal;
+    float fx;
+    float fy;
+    float fz;
+    float sigma;
+    float rx;
+    float ry;
+    float distance;
+    uint t;
+} ubo;
+
+layout(std430, binding = 1) buffer Particles {
+    Particle particles[];
+};
+
+layout(std430, binding = 2) buffer Velocity {
+	float16_t vels[];
+};
+
+layout(std430, binding = 3) buffer Rho {
+	float16_t rhos[];
+};
+
+layout(std430, binding = 4) buffer Flag {
+    uint flags[];
+};
+
+layout(std430, binding = 5) buffer DDF1 {
+	f16vec4 ddf1_packed[];
+};
+
+layout(std430, binding = 6) buffer CellForce {
+    float cfs[];
+};
+
+layout(std430, binding = 7) buffer Phi {
+    float phis[];
+};
+
+layout(std430, binding = 8) buffer WireframeVertex {
+    Vertex wireframes[];
+};
+
+layout(std430, binding = 9) buffer WireframeIndex {
+    uint wireframeIndices[];
+};
+
+layout(std430, binding = 10) buffer SurfaceVertex {
+    Vertex surfaces[];
+};
+
+layout(std430, binding = 11) buffer Mass {
+    float masses[];
+};
+
+layout(std430, binding = 12) buffer MassEx {
+    float massexes[];
+};
+
+layout(std430, binding = 13) buffer ParticleCount {
+	VkDrawIndirectCommand particleCount;
+};
+
+layout(std430, binding = 14) buffer WireframeCount {
+	VkDrawIndirectCommand wireframeCount;
+};
+
+layout(std430, binding = 15) buffer SurfaceCount {
+	VkDrawIndirectCommand surfaceCount;
+};
+
+layout(std430, binding = 16) buffer DDF2 {
+	f16vec4 ddf2_packed[];
+};
+
+layout(std430, binding = 17) buffer States {
+	f16vec4 states[];
+};
+
+layout(std430, binding = 18) buffer TotalMass {
+	float totalMass[];
+};
+
+// 辅助：从 DDF1 读取单个分量
+float read_ddf1(uint n, uint q) {
+	uint vec_idx = n * 5 + q / 4; // 第几个 vec4
+	uint comp_idx = q % 4;         // vec4 中的第几个分量
+	return float(ddf1_packed[vec_idx][comp_idx]);
+}
+
+// 辅助：从 DDF2 读取单个分量
+float read_ddf2(uint n, uint q) {
+	uint vec_idx = n * 5 + q / 4;
+	uint comp_idx = q % 4;
+	return float(ddf2_packed[vec_idx][comp_idx]);
+}
+
+// 辅助：写入 DDF1 单个分量
+void write_ddf1(uint n, uint q, float val) {
+	uint vec_idx = n * 5 + q / 4;
+	uint comp_idx = q % 4;
+	ddf1_packed[vec_idx][comp_idx] = float16_t(val);
+}
+
+// 辅助：写入 DDF2 单个分量
+void write_ddf2(uint n, uint q, float val) {
+	uint vec_idx = n * 5 + q / 4;
+	uint comp_idx = q % 4;
+	ddf2_packed[vec_idx][comp_idx] = float16_t(val);
+}
+
+void load_macro(uint index, out float rho, out float ux, out float uy, out float uz) {
+	f16vec4 data = states[index];
+	ux = float(data.x);
+	uy = float(data.y);
+	uz = float(data.z);
+	rho = float(data.w);
+}
+
+void store_macro(uint index, float rho, float ux, float uy, float uz) {
+	states[index] = f16vec4(float16_t(ux), float16_t(uy), float16_t(uz), float16_t(rho));
+}
+
+uint index_f(uint n, uint i) {
+	return i * ubo.Nxyz + n;
+}
+
+int c(const uint i) {
+	return e[i % Q][i / Q];
+}
+
+int c_D3Q27(const uint i) { // avoid constant keyword by encapsulating data in function which gets inlined by compiler
+	const int c[3 * 27] = {
+		0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1,-1, 1, // x
+		0, 0, 0, 1,-1, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, // y
+		0, 0, 0, 0, 0, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0,-1, 1,-1, 1, 1,-1,-1, 1, 1,-1, 1,-1  // z
+	};
+	return c[i];
+}
+
+float sq(float x) {
+	return x * x;
+}
+
+float cb(float x) {
+	return pow(x, 3);
+}
+
+float cbrt(float x) {
+	return pow(x, 1.0f / 3.0f);
+}
+
+float rand(uint n) {
+	n = (n << 13U) ^ n;
+	n = n * (n * n * 15731U + 789221U) + 1376312589U;
+	return float(n & 0x7fffffffU) / 2147483647.0;
+}
+
+uvec3 coordinates(const uint n) { // disassemble 1D index to 3D coordinates (n -> x,y,z)
+	//const uint t = uint(n % (ubo.Nx * ubo.Ny));
+	//return uvec3(t % ubo.Nx, t / ubo.Nx, uint(n / (ubo.Nx * ubo.Ny))); // n = x+(y+z*Ny)*Nx
+	uint a = ubo.Nx * ubo.Ny, z = n / a, b = n - z * a, y = b / ubo.Nx, x = b - y * ubo.Nx;
+	return uvec3(x, y, z);
+}
+
+void calculate_indices(uint n, inout uint x0, inout uint xp, inout uint xm, inout uint y0, inout uint yp, inout uint ym, inout uint z0, inout uint zp, inout uint zm) {
+	const uvec3 xyz = coordinates(n);
+	x0 = uint(xyz.x); // pre-calculate indices (periodic boundary conditions)
+	xp = uint(((xyz.x + 1u) % ubo.Nx));
+	xm = uint(((xyz.x + ubo.Nx - 1u) % ubo.Nx));
+	y0 = uint((xyz.y * ubo.Nx));
+	yp = uint((((xyz.y + 1u) % ubo.Ny) * ubo.Nx));
+	ym = uint((((xyz.y + ubo.Ny - 1u) % ubo.Ny) * ubo.Nx));
+	z0 = uint(xyz.z * uint(ubo.Ny * ubo.Nx));
+	zp = uint(((xyz.z + 1u) % ubo.Nz) * uint(ubo.Ny * ubo.Nx));
+	zm = uint(((xyz.z + ubo.Nz - 1u) % ubo.Nz) * uint(ubo.Ny * ubo.Nx));
+}
+
+void neighbors(uint index, inout uint nbs[Q]) {
+	uint x0, xp, xm, y0, yp, ym, z0, zp, zm;
+	calculate_indices(index, x0, xp, xm, y0, yp, ym, z0, zp, zm);
+	nbs[0] = index;
+	nbs[1] = xp + y0 + z0; nbs[2] = xm + y0 + z0; // +00 -00
+	nbs[3] = x0 + yp + z0; nbs[4] = x0 + ym + z0; // 0+0 0-0
+	nbs[5] = x0 + y0 + zp; nbs[6] = x0 + y0 + zm; // 00+ 00-
+	nbs[7] = xp + yp + z0; nbs[8] = xm + ym + z0; // ++0 --0
+	nbs[9] = xp + y0 + zp; nbs[10] = xm + y0 + zm; // +0+ -0-
+	nbs[11] = x0 + yp + zp; nbs[12] = x0 + ym + zm; // 0++ 0--
+	nbs[13] = xp + ym + z0; nbs[14] = xm + yp + z0; // +-0 -+0
+	nbs[15] = xp + y0 + zm; nbs[16] = xm + y0 + zp; // +0- -0+
+	nbs[17] = x0 + yp + zm; nbs[18] = x0 + ym + zp; // 0+- 0-+
+}
+
+//bool in_from_direction(uint n, uint q, out ivec3 qf, out ivec3 nbf) {
+//	qf = -e[q];
+//	nbf = qf;
+//	int x = qf.x, y = qf.y, z = qf.z;
+//
+//	bool isCollide = false;
+//	if (x != 0) {
+//		if ((flags[n + qf[0]] & TYPE_BO) == TYPE_S) {
+//			qf.x = -qf.x;
+//			nbf.x = 0;
+//			isCollide = true;
+//		}
+//	}
+//	if (y != 0) {
+//		if ((flags[n + qf[1] * ubo.Nx] & TYPE_BO) == TYPE_S) {
+//			qf.y = -qf.y;
+//			nbf.y = 0;
+//			isCollide = true;
+//		}
+//	}
+//	if (z != 0) {
+//		if ((flags[n + qf[2] * ubo.Nx * ubo.Ny] & TYPE_BO) == TYPE_S) {
+//			qf.z = -qf.z;
+//			nbf.z = 0;
+//			isCollide = true;
+//		}
+//	}
+//	qf = -qf;
+//	return isCollide;
+//}
+
+bool in_from_direction(uint n, uint q, out ivec3 out_qf, out ivec3 out_nbf) {
+	// 1. 获取基础方向（直接用寄存器中的 e[q]）
+	ivec3 dir = e[q];
+	ivec3 check_dir = -dir; // 我们检查的是“反方向”的邻居
+
+	// 2. 预计算步长，避免重复乘法 (假设 Nx, Ny 在 ubo 中)
+	// 如果 ubo.Nx 是常量，编译器会自动优化；如果是变量，这样写更清晰
+	uint sy = ubo.Nx;
+	uint sz = ubo.Nx * ubo.Ny;
+
+	// 3. 碰撞检测 (使用 bvec3 减少控制流依赖)
+	bvec3 collide = bvec3(false);
+
+	// X 轴检查
+	if (check_dir.x != 0) {
+		// 只有非 0 时才读内存 (节省显存带宽的关键)
+		// 注意：flags[] 是 uint8 还是 uint？读取开销较大
+		if ((flags[n + check_dir.x] & TYPE_BO) == TYPE_S) {
+			collide.x = true;
+		}
+	}
+
+	// Y 轴检查
+	if (check_dir.y != 0) {
+		if ((flags[n + check_dir.y * sy] & TYPE_BO) == TYPE_S) {
+			collide.y = true;
+		}
+	}
+
+	// Z 轴检查
+	if (check_dir.z != 0) {
+		if ((flags[n + check_dir.z * sz] & TYPE_BO) == TYPE_S) {
+			collide.z = true;
+		}
+	}
+
+	// 4. 结果构造 (无状态依赖，极其节省寄存器)
+	// 逻辑推导结论：
+	// Collide: out_qf = -dir, out_nbf = 0
+	// Normal : out_qf =  dir, out_nbf = -dir
+
+	// 使用 ternary operator (三元运算符) 选择结果
+	// 这种写法会被编译为 CMOV (条件移动) 或 Select 指令，无分支，非常快
+	out_qf.x = collide.x ? -dir.x : dir.x;
+	out_qf.y = collide.y ? -dir.y : dir.y;
+	out_qf.z = collide.z ? -dir.z : dir.z;
+
+	out_nbf.x = collide.x ? 0 : -dir.x;
+	out_nbf.y = collide.y ? 0 : -dir.y;
+	out_nbf.z = collide.z ? 0 : -dir.z;
+
+	// 返回是否有任意碰撞
+	return any(collide);
+}
+
+//uint get_q(ivec3 q) {
+//	if (q.x >= 1) {
+//		if (q.y >= 1) {
+//			return 7u;
+//		}
+//		else if (q.y == 0) {
+//			if (q.z >= 1) {
+//				return 9u;
+//			}
+//			else if (q.z == 0) {
+//				return 1u;
+//			}
+//			else {
+//				return 15u;
+//			}
+//		}
+//		else if (q.y <= -1) {
+//			return 13u;
+//		}
+//	}
+//	else if (q.x == 0) {
+//		if (q.y >= 1) {
+//			if (q.z >= 1) {
+//				return 11u;
+//			}
+//			else if (q.z == 0) {
+//				return 3u;
+//			}
+//			else if (q.z <= -1){
+//				return 17u;
+//			}
+//		}
+//		else if (q.y == 0) {
+//			if (q.z >= 1) {
+//				return 5u;
+//			}
+//			else if (q.z == 0) {
+//				return 0u;
+//			}
+//			else if (q.z <= -1) {
+//				return 6u;
+//			}
+//		}
+//		else if (q.y <= -1) {
+//			if (q.z >= 1) {
+//				return 18u;
+//			}
+//			else if (q.z == 0) {
+//				return 4u;
+//			}
+//			else if (q.z <= -1) {
+//				return 12u;
+//			}
+//		}
+//	}
+//	else {
+//		if (q.y >= 1) {
+//			return 14u;
+//		}
+//		else if (q.y == 0) {
+//			if (q.z >= 1) {
+//				return 16u;
+//			}
+//			else if (q.z == 0) {
+//				return 2u;
+//			}
+//			else if (q.z <= -1) {
+//				return 10u;
+//			}
+//		}
+//		else if (q.y <= -1) {
+//			return 8u;
+//		}
+//	}
+//}
+
+uint get_q(ivec3 q) {
+	return Q_LUT[(q.x + 1) * 9 + (q.y + 1) * 3 + (q.z + 1)];
+}
+
+void load_f_ns(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+	// 原始代码:
+	// fhn[0] = load(ddf1s, index_f(n, 0u));
+	// for (uint q = 1u; q < Q; q++) {
+	// 	uint inv_q = q % 2 == 0 ? q - 1u : q + 1u;
+	// 	fhn[q] = load(ddf1s, ((flags[nbs[inv_q]] & TYPE_BO) != TYPE_S) ? index_f(nbs[inv_q], q) : index_f(n, inv_q));
+	// }
+
+	// 修改后代码: 使用 read_ddf1 替代 load
+	fhn[0] = read_ddf1(n, 0u);
+	for (uint q = 1u; q < Q; q++) {
+		uint inv_q = q % 2 == 0 ? q - 1u : q + 1u;
+		// 判断是否是固体边界反弹
+		bool is_fluid_neighbor = (flags[nbs[inv_q]] & TYPE_BO) != TYPE_S;
+
+		// 如果是流体邻居，读取 neighbor 的 q 方向
+		// 如果是固体反弹，读取 self 的 inv_q 方向
+		if (is_fluid_neighbor) {
+			fhn[q] = read_ddf1(nbs[inv_q], q);
+		}
+		else {
+			fhn[q] = read_ddf1(n, inv_q);
+		}
+	}
+}
+
+void load_f_fs(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+	fhn[0] = read_ddf1(n, 0u);
+	for (uint q = 1u; q < Q; q++) {
+		ivec3 qf, nbf;
+		bool isCollide = in_from_direction(n, q, qf, nbf); // 计算是否碰撞
+		uint inv_q = get_q(nbf); // 获取反向索引
+
+		uint target_cell = isCollide ? n : nbs[inv_q];
+		uint target_dir = get_q(qf);
+
+		// 使用 read_ddf1 读取
+		fhn[q] = read_ddf1(target_cell, target_dir);
+	}
+}
+
+void load_f(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+	float fhn_ns[Q], fhn_fs[Q];
+	load_f_ns(n, fhn_ns, nbs, t);
+	load_f_fs(n, fhn_fs, nbs, t);
+	
+	for (uint q = 0u; q < Q; q++) {
+		fhn[q] = ubo.smoothness * fhn_fs[q] + (1.0f - ubo.smoothness) * fhn_ns[q];
+	}
+}
+
+void store_f(uint n, inout float fhn[Q], uint nbs[Q], uint t) {
+	// 原始代码:
+	// for (uint q = 0u; q < Q; q++) {
+	// 	store(ddf2s, index_f(n, q), fhn[q]);
+	// }	
+
+	// 修改后代码: 向量化写入 DDF2
+	// 手动构造 5 个向量，极大减少指令数和内存事务
+	// 注意: 需要显式转换 float -> float16_t
+
+	// Vec 0: q = 0, 1, 2, 3
+	f16vec4 v0 = f16vec4(float16_t(fhn[0]), float16_t(fhn[1]), float16_t(fhn[2]), float16_t(fhn[3]));
+
+	// Vec 1: q = 4, 5, 6, 7
+	f16vec4 v1 = f16vec4(float16_t(fhn[4]), float16_t(fhn[5]), float16_t(fhn[6]), float16_t(fhn[7]));
+
+	// Vec 2: q = 8, 9, 10, 11
+	f16vec4 v2 = f16vec4(float16_t(fhn[8]), float16_t(fhn[9]), float16_t(fhn[10]), float16_t(fhn[11]));
+
+	// Vec 3: q = 12, 13, 14, 15
+	f16vec4 v3 = f16vec4(float16_t(fhn[12]), float16_t(fhn[13]), float16_t(fhn[14]), float16_t(fhn[15]));
+
+	// Vec 4: q = 16, 17, 18, (19-padding)
+	f16vec4 v4 = f16vec4(float16_t(fhn[16]), float16_t(fhn[17]), float16_t(fhn[18]), float16_t(0.0));
+
+	// 计算基地址: n * 5
+	uint base = n * 5;
+
+	// 连续写入 5 个 64-bit 块 (最高效的写入模式)
+	ddf2_packed[base + 0] = v0;
+	ddf2_packed[base + 1] = v1;
+	ddf2_packed[base + 2] = v2;
+	ddf2_packed[base + 3] = v3;
+	ddf2_packed[base + 4] = v4;
+}
+
+void load_f_outgoing(const uint n, inout float fon[Q], const uint nbs[Q], const uint t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
+	//for(uint q=1u; q<Q; q+=2u) { // Esoteric-Pull
+	//	fon[q   ] = load(ddf1s, index_f(nbs[q], t%2u!=0 ? q    : q+1u));
+	//	fon[q+1u] = load(ddf1s, index_f(n     , t%2u!=0 ? q+1u : q   ));
+	//}
+	//for (uint q = 1u; q < Q; q += 2u) {
+	//	fon[q] = load(ddf1s, index_f(n, q));
+	//	fon[q + 1] = load(ddf1s, index_f(n, q + 1));
+	//}
+	// 修改后代码:
+	for (uint q = 1u; q < Q; q += 2u) {
+		// 从 DDF1 读取当前格子 n 的数据
+		fon[q] = read_ddf1(n, q);
+		fon[q + 1] = read_ddf1(n, q + 1);
+	}
+}
+
+void store_f_reconstructed(const uint n, const float fhn[Q], const uint nbs[Q], const uint t, const uint flagsj_su[Q]) { // store reconstructed gas DDFs, even: 1:1 like stream-in even, odd: 1:1 like stream-in odd
+	//for(uint q=1u; q<Q; q+=2u) { // Esoteric-Pull
+	//	if(flagsj_su[q+1u]==TYPE_G) store(ddf1s, index_f(n     , t%2u!=0 ? q    : q+1u), fhn[q   ]); // only store reconstructed gas DDFs to locations from which
+	//	if(flagsj_su[q   ]==TYPE_G) store(ddf1s, index_f(nbs[q], t%2u!=0 ? q+1u : q   ), fhn[q+1u]); // they are going to be streamed in during next stream_collide()
+	//}
+	//for (uint q = 1u; q < Q; q += 2u) {
+	//	if (flagsj_su[q + 1u] == TYPE_G) store(ddf1s, index_f(n, q), float16_t(fhn[q]));
+	//	if (flagsj_su[q] == TYPE_G) store(ddf1s, index_f(n, q + 1u), float16_t(fhn[q + 1u]));
+	//}
+	// 修改后代码:
+	// 注意这里写入的是 DDF1 (ddf1_packed)
+	for (uint q = 1u; q < Q; q += 2u) {
+		if (flagsj_su[q + 1u] == TYPE_G) {
+			write_ddf1(n, q, fhn[q]);
+		}
+		if (flagsj_su[q] == TYPE_G) {
+			write_ddf1(n, q + 1u, fhn[q + 1u]);
+		}
+	}
+}
+
+//void apply_moving_boundaries(inout float fhn[Q], const uint nbs[Q]) {
+//	for (uint q = 1u; q < 7u; q++) {
+//		uint inv_q = q % 2 == 0 ? q - 1u : q + 1u;
+//		if ((flags[nbs[inv_q]] & TYPE_BO) == TYPE_S) {
+//			fhn[q] -= 6.0f * w[inv_q] * (c(inv_q) * float(vels[nbs[inv_q]]) + c(Q + inv_q) * float(vels[ubo.Nxyz + nbs[inv_q]]) + c(2u * Q + inv_q) * float(vels[2u * ubo.Nxyz + nbs[inv_q]]));
+//		}
+//	}
+//	for (uint q = 7u; q < Q; q++) {
+//		uint inv_q = q % 2 == 0 ? q - 1u : q + 1u;
+//		if ((flags[nbs[inv_q]] & TYPE_BO) == TYPE_S) {
+//			fhn[q] -= (1.0f - ubo.smoothness) * (6.0f * w[inv_q] * (c(inv_q) * float(vels[nbs[inv_q]]) + c(Q + inv_q) * float(vels[ubo.Nxyz + nbs[inv_q]]) + c(2u * Q + inv_q) * float(vels[2u * ubo.Nxyz + nbs[inv_q]])));
+//		}
+//	}
+//}
+
+void apply_moving_boundaries(inout float fhn[Q], const uint nbs[Q]) {
+	// 循环 1: 轴向方向 (q=1..6)
+	for (uint q = 1u; q < 7u; q++) {
+		uint inv_q = q % 2 == 0 ? q - 1u : q + 1u; // 反方向索引
+		uint nb_idx = nbs[inv_q];                  // 邻居格子的索引
+
+		// 检查邻居是否为固体边界 (TYPE_S)
+		if ((flags[nb_idx] & TYPE_BO) == TYPE_S) {
+			// 【优化点 1】: 向量化读取速度
+			// 从 states 中一次性读取 xyz (速度)，并显式转为 FP32 用于计算
+			// 相比旧代码读三次内存，这里只需要访问一次缓存行
+			vec3 u_wall = vec3(states[nb_idx].xyz);
+
+			// 【优化点 2】: 获取离散速度向量 c
+			// e[inv_q] 已经在头文件中定义为 ivec3，直接拿来用即可
+			vec3 c_vec = vec3(e[inv_q]);
+
+			// 【优化点 3】: 使用内置点积函数替代手动乘加
+			// 计算 c * u
+			float cu = dot(c_vec, u_wall);
+
+			// 更新分布函数
+			fhn[q] -= 6.0f * w[inv_q] * cu;
+		}
+	}
+
+	// 循环 2: 对角线方向 (q=7..18)
+	for (uint q = 7u; q < Q; q++) {
+		uint inv_q = q % 2 == 0 ? q - 1u : q + 1u;
+		uint nb_idx = nbs[inv_q];
+
+		if ((flags[nb_idx] & TYPE_BO) == TYPE_S) {
+			// 同样的向量化逻辑
+			vec3 u_wall = vec3(states[nb_idx].xyz);
+			vec3 c_vec = vec3(e[inv_q]);
+			float cu = dot(c_vec, u_wall);
+
+			fhn[q] -= (1.0f - ubo.smoothness) * (6.0f * w[inv_q] * cu);
+		}
+	}
+}
+
+void calculate_rho_u(const float f[Q], inout float rhon, inout float uxn, inout float uyn, inout float uzn) {
+	float rho = f[0], ux, uy, uz;
+	for (uint q = 1u; q < Q; q++) rho += f[q]; // calculate density from fi
+	rho += 1.0f; // add 1.0f last to avoid digit extinction effects when summing up fi (perturbation method / DDF-shifting)
+	ux = f[1] - f[2] + f[7] - f[8] + f[9] - f[10] + f[13] - f[14] + f[15] - f[16];
+	uy = f[3] - f[4] + f[7] - f[8] + f[11] - f[12] + f[14] - f[13] + f[17] - f[18];
+	uz = f[5] - f[6] + f[9] - f[10] + f[11] - f[12] + f[16] - f[15] + f[18] - f[17];
+	rhon = rho;
+	uxn = ux / rho;
+	uyn = uy / rho;
+	uzn = uz / rho;
+}
+
+void calculate_forcing_terms(const float ux, const float uy, const float uz, const float fx, const float fy, const float fz, inout float Fin[Q]) {
+	const float uF = -0.33333334f * fma(ux, fx, fma(uy, fy, uz * fz)); // 3D
+	Fin[0] = 9.0f * def_w0 * uF; // 000 (identical for all velocity sets)
+	for (uint q = 1u; q < Q; q++) { // loop is entirely unrolled by compiler, no unnecessary FLOPs are happening
+		Fin[q] = 9.0f * w[q] * fma(c(q) * fx + c(Q + q) * fy + c(2u * Q + q) * fz, c(q) * ux + c(Q + q) * uy + c(2u * Q + q) * uz + 0.33333334f, uF);
+	}
+}
+
+void calculate_f_eq(const float rho, float ux, float uy, float uz, inout float feq[Q]) {
+	const float rhom1 = rho - 1.0f; // rhom1 is arithmetic optimization to minimize digit extinction
+	const float c3 = -3.0f * (sq(ux) + sq(uy) + sq(uz)); // c3 = -2*sq(u)/(2*sq(c))
+	uz *= 3.0f; // only needed for 3D
+	ux *= 3.0f;
+	uy *= 3.0f;
+	feq[0] = w[0] * fma(rho, 0.5f * c3, rhom1); // 000 (identical for all velocity sets)
+	const float u0 = ux + uy, u1 = ux + uz, u2 = uy + uz, u3 = ux - uy, u4 = ux - uz, u5 = uy - uz;
+	const float rhos = def_ws * rho, rhoe = def_we * rho, rhom1s = def_ws * rhom1, rhom1e = def_we * rhom1;
+	feq[1] = fma(rhos, fma(0.5f, fma(ux, ux, c3), ux), rhom1s); feq[2] = fma(rhos, fma(0.5f, fma(ux, ux, c3), -ux), rhom1s); // +00 -00
+	feq[3] = fma(rhos, fma(0.5f, fma(uy, uy, c3), uy), rhom1s); feq[4] = fma(rhos, fma(0.5f, fma(uy, uy, c3), -uy), rhom1s); // 0+0 0-0
+	feq[5] = fma(rhos, fma(0.5f, fma(uz, uz, c3), uz), rhom1s); feq[6] = fma(rhos, fma(0.5f, fma(uz, uz, c3), -uz), rhom1s); // 00+ 00-
+	feq[7] = fma(rhoe, fma(0.5f, fma(u0, u0, c3), u0), rhom1e); feq[8] = fma(rhoe, fma(0.5f, fma(u0, u0, c3), -u0), rhom1e); // ++0 --0
+	feq[9] = fma(rhoe, fma(0.5f, fma(u1, u1, c3), u1), rhom1e); feq[10] = fma(rhoe, fma(0.5f, fma(u1, u1, c3), -u1), rhom1e); // +0+ -0-
+	feq[11] = fma(rhoe, fma(0.5f, fma(u2, u2, c3), u2), rhom1e); feq[12] = fma(rhoe, fma(0.5f, fma(u2, u2, c3), -u2), rhom1e); // 0++ 0--
+	feq[13] = fma(rhoe, fma(0.5f, fma(u3, u3, c3), u3), rhom1e); feq[14] = fma(rhoe, fma(0.5f, fma(u3, u3, c3), -u3), rhom1e); // +-0 -+0
+	feq[15] = fma(rhoe, fma(0.5f, fma(u4, u4, c3), u4), rhom1e); feq[16] = fma(rhoe, fma(0.5f, fma(u4, u4, c3), -u4), rhom1e); // +0- -0+
+	feq[17] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), u5), rhom1e); feq[18] = fma(rhoe, fma(0.5f, fma(u5, u5, c3), -u5), rhom1e); // 0+- 0-+
+}
+
+void average_neighbors_fluid(const uint n, inout float rhon, inout float uxn, inout float uyn, inout float uzn) { // calculate average density and velocity of neighbors of cell n
+	uint nbs[Q]; // neighbor indices
+	neighbors(n, nbs); // calculate neighbor indices
+	float rhot = 0.0f, uxt = 0.0f, uyt = 0.0f, uzt = 0.0f, counter = 0.0f; // average over all fluid/interface neighbors
+	for (uint q = 1u; q < Q; q++) {
+		const uint flagsji_su = flags[nbs[q]] & TYPE_SU;
+		if (flagsji_su == TYPE_F) { // fluid neighbor
+			counter += 1.0f;
+			float rhonb, uxnb, uynb, uznb;
+			load_macro(nbs[q], rhonb, uxnb, uynb, uznb);
+			//rhot += rhos[nbs[q]];
+			//uxt += vels[nbs[q]];
+			//uyt += vels[ubo.Nxyz + nbs[q]];
+			//uzt += vels[2u * ubo.Nxyz + nbs[q]];
+			rhot += rhonb;
+			uxt += uxnb;
+			uyt += uynb;
+			uzt += uznb;
+		}
+	}
+	rhon = counter > 0.0f ? rhot / counter : 1.0f;
+	uxn = counter > 0.0f ? uxt / counter : 0.0f;
+	uyn = counter > 0.0f ? uyt / counter : 0.0f;
+	uzn = counter > 0.0f ? uzt / counter : 0.0f;
+}
+
+void average_neighbors_non_gas(const uint n, inout float rhon, inout float uxn, inout float uyn, inout float uzn) { // calculate average density and velocity of neighbors of cell n
+	uint nbs[Q]; // neighbor indices
+	neighbors(n, nbs); // calculate neighbor indices
+	float rhot = 0.0f, uxt = 0.0f, uyt = 0.0f, uzt = 0.0f, counter = 0.0f; // average over all fluid/interface neighbors
+	for (uint q = 1u; q < Q; q++) {
+		const uint flagsji_sus = flags[nbs[q]] & (TYPE_SU | TYPE_S); // extract SURFACE flags
+		if (flagsji_sus == TYPE_F || flagsji_sus == TYPE_I || flagsji_sus == TYPE_IF) { // fluid or interface or (interface->fluid) neighbor
+			counter += 1.0f;
+			float rhonb, uxnb, uynb, uznb;
+			load_macro(nbs[q], rhonb, uxnb, uynb, uznb);
+			//rhot += rhos[nbs[q]];
+			//uxt += vels[nbs[q]];
+			//uyt += vels[ubo.Nxyz + nbs[q]];
+			//uzt += vels[2u * ubo.Nxyz + nbs[q]];
+			rhot += rhonb;
+			uxt += uxnb;
+			uyt += uynb;
+			uzt += uznb;
+		}
+	}
+	rhon = counter > 0.0f ? rhot / counter : 1.0f;
+	uxn = counter > 0.0f ? uxt / counter : 0.0f;
+	uyn = counter > 0.0f ? uyt / counter : 0.0f;
+	uzn = counter > 0.0f ? uzt / counter : 0.0f;
+}
+
+float calculate_phi(const float rhon, const float massn, const uint flagsn) { // calculate fill level
+	return (flagsn & TYPE_F) != 0 ? 1.0f : (flagsn & TYPE_I) != 0 ? rhon > 0.0f ? clamp(massn / rhon, 0.0f, 1.0f) : 0.5f : 0.0f;
+}
+
+#ifdef CURVATURE
+vec3 calculate_normal_py(const float phij[27]) { // calculate surface normal vector (Parker-youngs approximation, more accurate, works only for D3Q27 neighborhood)
+	vec3 n; // normal vector
+	n.x = 4.0f * (phij[2] - phij[1]) + 2.0f * (phij[8] - phij[7] + phij[10] - phij[9] + phij[14] - phij[13] + phij[16] - phij[15]) + phij[20] - phij[19] + phij[22] - phij[21] + phij[24] - phij[23] + phij[25] - phij[26];
+	n.y = 4.0f * (phij[4] - phij[3]) + 2.0f * (phij[8] - phij[7] + phij[12] - phij[11] + phij[13] - phij[14] + phij[18] - phij[17]) + phij[20] - phij[19] + phij[22] - phij[21] + phij[23] - phij[24] + phij[26] - phij[25];
+	n.z = 4.0f * (phij[6] - phij[5]) + 2.0f * (phij[10] - phij[9] + phij[12] - phij[11] + phij[15] - phij[16] + phij[17] - phij[18]) + phij[20] - phij[19] + phij[21] - phij[22] + phij[24] - phij[23] + phij[26] - phij[25];
+
+	return normalize(n);
+}
+
+float plic_cube_reduced(const float V, const float n1, const float n2, const float n3) { // optimized solution from SZ and Kawano, source: https://doi.org/10.3390/computation10020021
+	const float n12 = n1 + n2, n3V = n3 * V;
+	if (n12 <= 2.0f * n3V) return n3V + 0.5f * n12; // case (5)
+	const float sqn1 = sq(n1), n26 = 6.0f * n2, v1 = sqn1 / n26; // after case (5) check n2>0 is true
+	if (v1 <= n3V && n3V < v1 + 0.5f * (n2 - n1)) return 0.5f * (n1 + sqrt(sqn1 + 8.0f * n2 * (n3V - v1))); // case (2)
+	const float V6 = n1 * n26 * n3V;
+	if (n3V < v1) return cbrt(V6); // case (1)
+	const float v3 = n3 < n12 ? (sq(n3) * (3.0f * n12 - n3) + sqn1 * (n1 - 3.0f * n3) + sq(n2) * (n2 - 3.0f * n3)) / (n1 * n26) : 0.5f * n12; // after case (2) check n1>0 is true
+	const float sqn12 = sqn1 + sq(n2), V6cbn12 = V6 - cb(n1) - cb(n2);
+	const bool case34 = n3V < v3; // true: case (3), false: case (4)
+	const float a = case34 ? V6cbn12 : 0.5f * (V6cbn12 - cb(n3));
+	const float b = case34 ? sqn12 : 0.5f * (sqn12 + sq(n3));
+	const float c = case34 ? n12 : 0.5f;
+	const float t = sqrt(sq(c) - b);
+	return c - 2.0f * t * sin(0.33333334f * asin((cb(c) - 0.5f * a - 1.5f * b * c) / cb(t)));
+}
+
+float plic_cube(const float V0, const vec3 n) { // unit cube - plane intersection: volume V0 in [0,1], normal vector n -> plane offset d0
+	const float ax = abs(n.x), ay = abs(n.y), az = abs(n.z), V = 0.5f - abs(V0 - 0.5f), l = ax + ay + az; // eliminate symmetry cases, normalize n using L1 norm
+	const float n1 = min(min(ax, ay), az) / l;
+	const float n3 = max(max(ax, ay), az) / l;
+	const float n2 = fdim(1.0f, n1 + n3); // ensure n2>=0
+	const float d = plic_cube_reduced(V, n1, n2, n3); // calculate PLIC with reduced symmetry
+	return l * copysign(0.5f - d, V0 - 0.5f); // rescale result and apply symmetry for V0>0.5
+}
+
+void get_remaining_neighbor_phij(const uint n, const float phit[Q], inout float phij[27]) { // get remaining phij for D3Q27 neighborhood
+	uint x0, xp, xm, y0, yp, ym, z0, zp, zm;
+	calculate_indices(n, x0, xp, xm, y0, yp, ym, z0, zp, zm);
+
+	// D3Q19
+	uint j[8]; // calculate remaining neighbor indices
+	j[0] = xp + yp + zp; j[1] = xm + ym + zm; // +++ ---
+	j[2] = xp + yp + zm; j[3] = xm + ym + zp; // ++- --+
+	j[4] = xp + ym + zp; j[5] = xm + yp + zm; // +-+ -+-
+	j[6] = xm + yp + zp; j[7] = xp + ym + zm; // -++ +--
+	for (uint i = 0u; i < 19u; i++) phij[i] = phit[i];
+	for (uint i = 19u; i < 27u; i++) phij[i] = phis[j[i - 19u]];
+}
+
+void lu_solve(float M[25], inout float x[5], float b[5], const int N, const int Nsol) { // solves system of N linear equations M*x=b within dimensionality Nsol<=N
+	for (int i = 0; i < Nsol; i++) { // decompose M in M=L*U
+		for (int j = i + 1; j < Nsol; j++) {
+			M[N * j + i] /= M[N * i + i];
+			for (int k = i + 1; k < Nsol; k++) M[N * j + k] -= M[N * j + i] * M[N * i + k];
+		}
+	}
+	for (int i = 0; i < Nsol; i++) { // find solution of L*y=b
+		x[i] = b[i];
+		for (int k = 0; k < i; k++) x[i] -= M[N * i + k] * x[k];
+	}
+	for (int i = Nsol - 1; i >= 0; i--) { // find solution of U*x=y
+		for (int k = i + 1; k < Nsol; k++) x[i] -= M[N * i + k] * x[k];
+		x[i] /= M[N * i + i];
+	}
+}
+
+float calculate_curvature(const uint n, const float phit[Q]) { // calculate surface curvature, always use D3Q27 stencil here, source: https://doi.org/10.3390/computation10020021
+	float phij[27];
+	get_remaining_neighbor_phij(n, phit, phij); // complete neighborhood from whatever velocity set is selected to D3Q27
+	const vec3 bz = calculate_normal_py(phij); // new coordinate system: bz is normal to surface, bx and by are tangent to surface
+	const vec3 rn = vec3(0.56270900f, 0.32704452f, 0.75921047f); // random normalized vector that is just by random chance not collinear with bz
+	const vec3 by = normalize(cross(bz, rn)); // normalize() is necessary here because bz and rn are not perpendicular
+	const vec3 bx = cross(by, bz);
+	uint number = 0; // number of neighboring interface points
+	vec3 p[24]; // number of neighboring interface points is less or equal than than 26 minus 1 gas and minus 1 fluid point = 24
+	const float center_offset = plic_cube(phij[0], bz); // calculate z-offset PLIC of center point only once
+	for (uint i = 1u; i < 27u; i++) { // iterate over neighbors, no loop unrolling here (50% better perfoemance without loop unrolling)
+		if (phij[i] > 0.0f && phij[i] < 1.0f) { // limit neighbors to interface cells
+			const vec3 ei = vec3(c_D3Q27(i), c_D3Q27(27u + i), c_D3Q27(2u * 27u + i)); // assume neighbor normal vector is the same as center normal vector
+			const float offset = plic_cube(phij[i], bz) - center_offset;
+			p[number++] = vec3(dot(ei, bx), dot(ei, by), dot(ei, bz) + offset); // do coordinate system transformation into (x, y, f(x,y)) and apply PLIC pffsets
+		}
+	}
+	float M[25], x[5] = { 0.0f,0.0f,0.0f,0.0f,0.0f }, b[5] = { 0.0f,0.0f,0.0f,0.0f,0.0f };
+	for (uint i = 0u; i < 25u; i++) M[i] = 0.0f;
+	for (uint i = 0u; i < number; i++) { // f(x,y)=A*x2+B*y2+C*x*y+H*x+I*y, x=(A,B,C,H,I), Q=(x2,y2,x*y,x,y), M*x=b, M=Q*Q^T, b=Q*z
+		const float x = p[i].x, y = p[i].y, z = p[i].z, x2 = x * x, y2 = y * y, x3 = x2 * x, y3 = y2 * y;
+		/**/M[0] += x2 * x2;   M[1] += x2 * y2;   M[2] += x3 * y;   M[3] += x3;   M[4] += x2 * y; b[0] += x2 * z;
+		/*  M[ 5]+=x2*y2;*/ M[6] += y2 * y2;   M[7] += x * y3;   M[8] += x * y2;   M[9] += y3; b[1] += y2 * z;
+		/*  M[10]+=x3*y ;   M[11]+=x *y3;*/ M[12] += x2 * y2;   M[13] += x2 * y;   M[14] += x * y2; b[2] += x * y * z;
+		/*  M[15]+=x3   ;   M[16]+=x *y2;   M[17]+=x2*y ;*/ M[18] += x2;   M[19] += x * y; b[3] += x * z;
+		/*  M[20]+=x2*y ;   M[21]+=   y3;   M[22]+=x *y2;   M[23]+=x *y ;*/ M[24] += y2; b[4] += y * z;
+	}
+	for (uint i = 1u; i < 5u; i++) { // use symmetry of matrix to save arithmetic operations
+		for (uint j = 0u; j < i; j++) M[i * 5 + j] = M[j * 5 + i];
+	}
+	if (number >= 5u) lu_solve(M, x, b, 5, 5);
+	else lu_solve(M, x, b, 5, int(min(5u, number))); // cannot do loop unrolling here -> slower -> extra if-else to avoid slowdown
+	const float A = x[0], B = x[1], C = x[2], H = x[3], I = x[4];
+	const float K = (A * (I * I + 1.0f) + B * (H * H + 1.0f) - C * H * I) * cb(rsqrt(H * H + I * I + 1.0f)); // mean curvature of Monge patch (x, y, f(x, y))
+
+	return clamp(K, -1.0f, 1.0f); // prevent extreme pressures in the case of almost degenerate matrices
+}
+#endif

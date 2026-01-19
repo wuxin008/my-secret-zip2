@@ -1,0 +1,81 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "simulation_header.glsl"
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+//    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+//    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+//    if (index >= ubo.Nxyz) return;
+//
+//    uint flagsn = flags[index]; // cache flags[n] for multiple readings
+//	const uint flagsn_bo=flagsn&TYPE_BO, flagsn_su=flagsn&TYPE_SU; // extract boundary and surface flags
+//	if(flagsn_bo==TYPE_S||flagsn_su==TYPE_G) return; // cell processed here is fluid or interface
+//
+//	uint nbs[Q]; // neighbor indices
+//	neighbors(index, nbs); // calculate neighbor indices
+//	float fhn[Q]; // incoming DDFs
+//	load_f(index, fhn, nbs, ubo.t); // load incoming DDFs
+//	float fon[Q]; // outgoing DDFs
+//	fon[0] = fhn[0]; // fon[0] is already loaded in fhn[0]
+//	load_f_outgoing(index, fon, nbs, ubo.t); // load outgoing DDFs
+//
+//    float massn = masses[index];
+//	for(uint q=1u; q<Q; q++) {
+//		massn += massexes[nbs[q]]; // distribute excess mass from last step which is stored in neighbors
+//	}
+//	if(flagsn_su==TYPE_F) { // cell is fluid
+//		//for(uint q=1; q<Q; q+=2u) { // calculate reconstructed gas DDFs
+//		//	massn += fhn[q+1u] - fon[q   ];
+//		//	massn += fhn[q   ] - fon[q+1u];
+//		//}
+//		for(uint q = 1; q < Q; q+=2) {
+//			massn += fhn[q] - fon[q];
+//			massn += fhn[q+1] - fon[q+1];
+//		}
+//		//for(uint q = 1u; q < Q; q++) {
+//		//	massn += fhn[q] - fon[q];
+//		//}
+//	} else if(flagsn_su==TYPE_I) { // cell is interface
+//		float phij[Q]; // cache fill level of neighbor lattice points
+//		for(uint q=1u; q<Q; q++) phij[q] = phis[nbs[q]]; // cache fill level of neighbor lattice points
+//		float rhon, uxn, uyn, uzn, rho_laplace=0.0f; // no surface tension if rho_laplace is not overwritten later
+//#ifndef EQUILIBRIUM_BOUNDARIES
+//		calculate_rho_u(fon, rhon, uxn, uyn, uzn); // calculate density and velocity fields from fon (not fhn)
+//#else // EQUILIBRIUM_BOUNDARIES
+//		if(flagsn_bo==TYPE_E) {
+//			rhon = rhos[            index]; // apply preset velocity/density
+//			uxn  = vels[            index];
+//			uyn  = vels[   ubo.Nxyz+index];
+//			uzn  = vels[2u*ubo.Nxyz+index];
+//		} else {
+//			calculate_rho_u(fon, rhon, uxn, uyn, uzn); // calculate density and velocity fields from fon (not fhn)
+//		}
+//#endif // EQUILIBRIUM_BOUNDARIES
+//		uxn = clamp(uxn, -def_c, def_c); // limit velocity (for stability purposes)
+//		uyn = clamp(uyn, -def_c, def_c);
+//		uzn = clamp(uzn, -def_c, def_c);
+//		phij[0] = calculate_phi(rhon, massn, flagsn); // don't load phi[n] from memory, instead recalculate it with mass corrected by excess mass
+//		rho_laplace = ubo.sigma==0.0f ? 0.0f : ubo.sigma*calculate_curvature(index, phij); // surface tension least squares fit (PLIC, most accurate)
+//		float feg[Q]; // reconstruct f from neighbor gas lattice points
+//		const float rho2tmp = 0.5f/rhon; // apply external volume force (Guo forcing, Krueger p.233f)
+//		const float uxntmp = clamp(fma(ubo.fx, rho2tmp, uxn), -def_c, def_c); // limit velocity (for stability purposes)
+//		const float uyntmp = clamp(fma(ubo.fy, rho2tmp, uyn), -def_c, def_c); // force term: F*dt/(2*rho)
+//		const float uzntmp = clamp(fma(ubo.fz, rho2tmp, uzn), -def_c, def_c);
+//		calculate_f_eq(1.0f-rho_laplace, uxntmp, uyntmp, uzntmp, feg); // calculate gas equilibrium DDFs with constant ambient pressure
+//		uint flagsj_su[Q]; // cache neighbor flags for multiple readings
+//		for(uint q=1u; q<Q; q++) flagsj_su[q] = flags[nbs[q]]&TYPE_SU;
+//		for(uint q=1u; q<Q; q+=2u) { // calculate mass exchange between current cell and fluid/interface cells
+//			massn += (flagsj_su[q   ]&(TYPE_F|TYPE_I))!=0 ? flagsj_su[q   ]==TYPE_F ? fhn[q+1]-fon[q   ] : 0.5f*(phij[q   ]+phij[0])*(fhn[q+1u]-fon[q   ]) : 0.0f; // neighbor is fluid or interface cell
+//			massn += (flagsj_su[q+1u]&(TYPE_F|TYPE_I))!=0 ? flagsj_su[q+1u]==TYPE_F ? fhn[q  ]-fon[q+1u] : 0.5f*(phij[q+1u]+phij[0])*(fhn[q   ]-fon[q+1u]) : 0.0f; // fluid : interface : gas
+//		}
+//		for(uint q=1u; q<Q; q+=2u) { // calculate reconstructed gas DDFs
+//			fhn[q   ] = feg[q+1u]-fon[q+1u]+feg[q   ];
+//			fhn[q+1u] = feg[q   ]-fon[q   ]+feg[q+1u];
+//		}
+//		store_f_reconstructed(index, fhn, nbs, ubo.t, flagsj_su); // store reconstructed gas DDFs that are streamed in during the following stream_collide()
+//	}
+//	masses[index] = massn;
+}

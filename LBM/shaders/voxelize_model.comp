@@ -1,0 +1,59 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_debug_printf : enable
+
+layout(std430, push_constant) uniform ModelPushConstants{
+    float particle_number;
+	uint flag_type;
+} pcs;
+
+layout(std430, binding = 0) uniform SimulateUBO{
+    uint Nx;
+    uint Ny;
+    uint Nz;
+    uint Nxyz;
+    uint particleCount;
+    float particleRho;
+    float niu;
+    float smoothness;
+    float tau;
+    float inv_tau;
+    float isoVal;
+    float fx;
+    float fy;
+    float fz;
+    float sigma;
+    float rx;
+    float ry;
+    float distance;
+    uint t;
+} ubo;
+
+layout(std430, binding = 1) buffer Flag {
+    float flags[];
+};
+
+layout(std430, binding = 2) buffer Points {
+    vec4 points[];
+};
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() 
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= pcs.particle_number) {
+		return;
+	}
+	
+	vec4 p = points[index];
+	float x = p.x, y = p.y, z = p.z;
+
+	if (x < 0 || x >= ubo.Nx || y < 0 || y >= ubo.Ny || z < 0 || z >= ubo.Nz) {
+		return;
+	}
+
+	uint ux = uint(x), uy = uint(y), uz = uint(z);
+	flags[ux + (uy + uz * ubo.Ny) * ubo.Nx] = pcs.flag_type;
+}

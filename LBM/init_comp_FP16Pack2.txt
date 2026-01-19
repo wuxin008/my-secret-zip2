@@ -1,0 +1,95 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "simulation_header.glsl"
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main()
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
+
+    uint flagsn = flags[index];
+    uint flagsn_bo = flagsn & TYPE_BO; // extract boundary flags
+
+	//float rhon, uxn, uyn, uzn;
+	//load_macro(index, rhon, uxn, uyn, uzn);
+
+    uint nbs[Q]; // neighbor indices
+    neighbors(index, nbs); // calculate neighbor indices
+
+    uint nbflags[Q]; // cache neighbor flags for multiple readings
+    for(uint q=1u; q<Q; q++) nbflags[q] = flags[nbs[q]];
+
+    if(flagsn_bo==TYPE_S) { // cell is solid
+		bool TYPE_ONLY_S = true; // has only solid neighbors
+		for(uint q=1u; q<Q; q++) TYPE_ONLY_S = TYPE_ONLY_S&&(nbflags[q]&TYPE_BO)==TYPE_S;
+		if(TYPE_ONLY_S) {
+			//store_macro(index, rhon, 0.0f, 0.0f, 0.0f);
+			vels[            index] = float16_t(0.0f); // reset velocity for solid lattice points with only boundary neighbors
+			vels[   ubo.Nxyz+index] = float16_t(0.0f);
+			vels[2u*ubo.Nxyz+index] = float16_t(0.0f);
+		}
+#ifndef MOVING_BOUNDARIES
+        if(flagsn_bo==TYPE_S) {
+			//store_macro(index, rhon, 0.0f, 0.0f, 0.0f);
+			vels[            index] = float16_t(0.0f); // reset velocity for all solid lattice points
+			vels[   ubo.Nxyz+index] = float16_t(0.0f);
+			vels[2u*ubo.Nxyz+index] = float16_t(0.0f);
+		}
+#else
+    }else if (flagsn_bo!=TYPE_E) {
+        bool next_to_moving_boundary = false;
+		for(uint q=1u; q<Q; q++) {
+			//float rhonb, uxnb, uynb, uznb;
+			//load_macro(nbs[q], rhonb, uxnb, uynb, uznb);
+			next_to_moving_boundary = next_to_moving_boundary||((nbflags[q]&TYPE_BO)==TYPE_S&&(vels[nbs[q]]!=0.0f||vels[ubo.Nxyz+nbs[q]]!=0.0f||vels[2u*ubo.Nxyz+nbs[q]]!=0.0f));
+		}
+		flags[index] = flagsn = next_to_moving_boundary ? flagsn|TYPE_MS : flagsn&~TYPE_BO; // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
+#endif
+    }
+
+    float feq[Q]; // f_equilibrium
+	//calculate_f_eq(rhon, uxn, uyn, uzn, feq);
+	calculate_f_eq(rhos[index], vels[index], vels[ubo.Nxyz+index], vels[2u*ubo.Nxyz+index], feq);
+
+#ifdef SURFACE // automatically generate the interface layer between fluid and gas
+    { // separate block to avoid variable name conflicts
+        float phin = phis[index];
+        if(!((flagsn&(TYPE_S|TYPE_E|TYPE_T|TYPE_F|TYPE_I)) != 0)) flagsn = (flagsn&~TYPE_SU)|TYPE_G; // change all non-fluid and non-interface flags to gas
+		if((flagsn&TYPE_SU)==TYPE_G) { // cell with updated flags is gas
+			bool change = false; // check if cell has to be changed to interface
+			for(uint q=1u; q<Q; q++) change = change||(nbflags[q]&TYPE_SU)==TYPE_F; // if neighbor flag fluid is set, the cell must be interface
+			if(change) { // create interface automatically if phi has not explicitely defined for the interface layer
+				flagsn = (flagsn&~TYPE_SU)|TYPE_I; // cell must be interface
+				phin = 0.5f;
+				float rhon, uxn, uyn, uzn; // initialize interface cells with average density/velocity of fluid neighbors
+				average_neighbors_fluid(index, rhon, uxn, uyn, uzn); // get average rho/u from all fluid neighbors
+				calculate_f_eq(rhon, uxn, uyn, uzn, feq); // calculate equilibrium DDFs
+			}
+		}
+		if((flagsn&TYPE_SU)==TYPE_G) { // cell with updated flags is still gas
+			vels[            index] = float16_t(0.0f); // reset velocity for gas cells
+			vels[   ubo.Nxyz+index] = float16_t(0.0f);
+			vels[2u*ubo.Nxyz+index] = float16_t(0.0f);
+			//uxn = 0.0f; // reset velocity for gas cells
+			//uyn = 0.0f;
+			//uzn = 0.0f;
+			phin = 0.0f;
+			//store_macro(index, rhon, uxn, uyn, uzn);
+		} else if((flagsn&TYPE_SU)==TYPE_I && (phin<0.0f||phin>1.0f)) {
+			phin = 0.5f; // cell should be interface, but phi was invalid
+		} else if((flagsn&TYPE_SU)==TYPE_F) {
+			phin = 1.0f;
+		}
+		phis[index] = phin;
+		masses[index] = phin*rhos[index];
+		//masses[index] = phin*rhon;
+		massexes[index] = 0.0f; // reset excess mass
+		flags[index] = flagsn;
+    }
+#endif
+	//return;
+    store_f(index, feq, nbs, 0u); // write to fi
+}

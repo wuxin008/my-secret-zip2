@@ -1,0 +1,36 @@
+#version 450
+#extension GL_ARB_shading_language_include : require
+#include "simulation_header.glsl"
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// apply flag changes and calculate excess mass
+void main()
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
+    
+	const uint flagsn_sus = flags[index]&(TYPE_SU|TYPE_S); // extract SURFACE flags
+	if(flagsn_sus==TYPE_GI) { // initialize the fi of gas cells that should become interface
+		float rhon, uxn, uyn, uzn; // average over all fluid/interface neighbors
+		average_neighbors_non_gas(index, rhon, uxn, uyn, uzn); // get average rho/u from all fluid/interface neighbors
+		float feq[Q];
+		calculate_f_eq(rhon, uxn, uyn, uzn, feq); // calculate equilibrium DDFs
+		uint nbs[Q];
+		neighbors(index, nbs);
+		store_f(index, feq, nbs, ubo.t); // write feq to fi in video memory
+	} else if(flagsn_sus==TYPE_IG) { // flag interface->gas is set
+		uint nbs[Q]; // neighbor indices
+		neighbors(index, nbs); // calculate neighbor indices
+		for(uint q=1u; q<Q; q++) {
+			const uint flagsji = flags[nbs[q]];
+			const uint flagsji_su = flagsji&(TYPE_SU|TYPE_S); // extract SURFACE flags
+			const uint flagsji_r = flagsji&~TYPE_SU; // extract all non-SURFACE flags
+			if(flagsji_su==TYPE_F||flagsji_su==TYPE_IF) {
+				flags[nbs[q]] = flagsji_r|TYPE_I; // prevent fluid or interface neighbors that turn to fluid from being/becoming fluid
+			}
+		}
+	}
+}
+// possible types at the end of surface_2(): TYPE_F / TYPE_I / TYPE_G / TYPE_IF / TYPE_IG / TYPE_GI
