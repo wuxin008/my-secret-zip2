@@ -1,0 +1,34 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_ARB_shading_language_include : require
+#extension GL_EXT_shader_atomic_float : enable
+#include "simulation_header.glsl"
+
+shared float s_GroupSum;
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() 
+{
+    uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
+    uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
+
+    float mass = masses[index];
+
+    float subGroupSum = subgroupAdd(mass);
+
+    if (gl_LocalInvocationIndex == 0) {
+        s_GroupSum = 0.0; // 初始化共享内存
+    }
+
+    if (subgroupElect()) {
+        atomicAdd(s_GroupSum, subGroupSum);
+    }
+    
+    barrier(); // 等待所有 Subgroup 完成累加
+
+    if (gl_LocalInvocationIndex == 0) {
+        atomicAdd(totalMass[0], s_GroupSum);
+    }
+}

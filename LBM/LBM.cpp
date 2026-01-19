@@ -1700,6 +1700,30 @@ void LBM::createComputePipeline() {
         vkDestroyShaderModule(device, computeShaderModule, nullptr);
     }
 
+    // addupTotalMass
+    {
+        auto computeShaderCode = readFile("shaders/addupTotalMass_comp.spv");
+
+        VkShaderModule computeShaderModule = createShaderModule(computeShaderCode);
+
+        VkPipelineShaderStageCreateInfo computeShaderStageInfo{};
+        computeShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        computeShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        computeShaderStageInfo.module = computeShaderModule;
+        computeShaderStageInfo.pName = "main";
+
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.layout = computePipelineLayout;
+        pipelineInfo.stage = computeShaderStageInfo;
+
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &addupTotalMassPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create compute pipeline!");
+        }
+
+        vkDestroyShaderModule(device, computeShaderModule, nullptr);
+    }
+
     // calc
     {
         auto computeShaderCode = readFile("shaders/calc_comp.spv");
@@ -2141,7 +2165,7 @@ void LBM::createSkybox() {
     ktxResult result;
     ktxTexture* ktxTexture;
 
-    result = ktxTexture_CreateFromNamedFile("textures/output.ktx", KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &ktxTexture);
+    result = ktxTexture_CreateFromNamedFile("textures/skybox.ktx", KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &ktxTexture);
     assert(result == KTX_SUCCESS, "cannot load skybox texture");
 
     const uint32_t width = ktxTexture->baseWidth;
@@ -3881,6 +3905,12 @@ void LBM::recordComputeCommandBuffer(VkCommandBuffer commandBuffer) {
         //vkCmdDispatch(commandBuffer, sqrt(PARTICLE_COUNT) / 16, sqrt(PARTICLE_COUNT) / 16, 1);
         vkCmdDispatch(commandBuffer, Nxyz / 64 + 1, 1, 1);
 
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, addupTotalMassPipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &computeDescriptorSets[currentFrame], 0, nullptr);
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memorybarrier, 0, nullptr, 0, nullptr);
+        //vkCmdDispatch(commandBuffer, sqrt(PARTICLE_COUNT) / 16, sqrt(PARTICLE_COUNT) / 16, 1);
+        vkCmdDispatch(commandBuffer, Nxyz / 64 + 1, 1, 1);
+
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, surface1Pipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &computeDescriptorSets[currentFrame], 0, nullptr);
         vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memorybarrier, 0, nullptr, 0, nullptr);
@@ -3912,6 +3942,7 @@ void LBM::recordComputeCommandBuffer(VkCommandBuffer commandBuffer) {
     vkCmdUpdateBuffer(commandBuffer, particleCountBuffers[currentFrame], 0, sizeof(VkDrawIndirectCommand), &initialCmd);
     vkCmdUpdateBuffer(commandBuffer, wireframeCountBuffers[currentFrame], 0, sizeof(VkDrawIndirectCommand), &initialCmd);
     vkCmdUpdateBuffer(commandBuffer, surfaceCountBuffers[currentFrame], 0, sizeof(VkDrawIndirectCommand), &initialCmd);
+    vkCmdFillBuffer(commandBuffer, totalMassBuffers[currentFrame], 0, sizeof(float), 0.0f);
 
     VkMemoryBarrier memoryBarrier = {};
     memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;

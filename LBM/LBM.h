@@ -415,6 +415,7 @@ private:
     VkPipeline surface2Pipeline;
     VkPipeline surface3Pipeline;
     VkPipeline collideAndStreamPipeline;
+    VkPipeline addupTotalMassPipeline;
     VkPipeline filteredPipeline;
     VkPipeline postprocessPipeline;
 

@@ -80,8 +80,6 @@ void main()
 	}
 
 	masses[index] = massn;
-
-	atomicAdd(totalMass[0], massn);
 #endif
 
 #ifdef MOVING_BOUNDARIES

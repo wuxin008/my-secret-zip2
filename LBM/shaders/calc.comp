@@ -454,14 +454,13 @@ void main()
 {
     uvec3 globalSize = gl_NumWorkGroups * gl_WorkGroupSize;
     uint index = gl_GlobalInvocationID.z * globalSize.x * globalSize.y + gl_GlobalInvocationID.y * globalSize.x + gl_GlobalInvocationID.x;
+    if (index >= ubo.Nxyz) return;
 
     //calc_surface(index);
 
     //calc_wireframe(index);
 
     calc_particle(index, 1u);
-
-    totalMass[0] = 0.0f;
 
     //uint x = index % ubo.Nx, y = (index - x) / ubo.Nx % ubo.Ny, z = index / ubo.Nx / ubo.Ny;
     //if (x >= ubo.Nx - 1 || y >= ubo.Ny - 1 || z >= ubo.Nz - 1) return;
